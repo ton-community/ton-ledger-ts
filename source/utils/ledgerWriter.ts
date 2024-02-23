@@ -12,6 +12,13 @@ export function writeUint16(value: number) {
     return b;
 }
 
+export function writeUint48(value: number) {
+    let b = Buffer.alloc(6);
+    b.writeUint16BE(value >> 32, 0);
+    b.writeUint32BE(value & ((1 << 32) - 1), 2);
+    return b;
+}
+
 export function writeUint64(value: bigint) {
     return beginCell().storeUint(value, 64).endCell().beginParse().loadBuffer(8);
 }
@@ -39,4 +46,11 @@ export function writeCellRef(ref: Cell) {
         writeUint16(ref.depth()),
         ref.hash()
     ])
+}
+
+export function writeCellInline(bytes: Buffer) {
+    return Buffer.concat([
+        writeUint8(bytes.length),
+        bytes,
+    ]);
 }

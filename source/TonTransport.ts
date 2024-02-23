@@ -1,8 +1,8 @@
 import Transport from "@ledgerhq/hw-transport";
 import { Address, beginCell, Cell, contractAddress, SendMode, StateInit, storeStateInit } from "@ton/core";
-import { signVerify } from '@ton/crypto';
+import { sha256_sync, signVerify } from '@ton/crypto';
 import { AsyncLock } from 'teslabot';
-import { writeAddress, writeCellRef, writeUint16, writeUint32, writeUint64, writeUint8, writeVarUInt } from "./utils/ledgerWriter";
+import { writeAddress, writeCellInline, writeCellRef, writeUint16, writeUint32, writeUint48, writeUint64, writeUint8, writeVarUInt } from "./utils/ledgerWriter";
 import { getInit } from "./utils/getInit";
 
 const LEDGER_SYSTEM = 0xB0;
@@ -13,10 +13,21 @@ const INS_SIGN_TX = 0x06;
 const INS_PROOF = 0x08;
 const INS_SIGN_DATA = 0x09;
 
+const DEFAULT_SUBWALLET_ID = 698983191;
+
 export type TonPayloadFormat =
+    | { type: 'unsafe', message: Cell }
     | { type: 'comment', text: string }
     | { type: 'jetton-transfer', queryId: bigint | null, amount: bigint, destination: Address, responseDestination: Address, customPayload: Cell | null, forwardAmount: bigint, forwardPayload: Cell | null }
     | { type: 'nft-transfer', queryId: bigint | null, newOwner: Address, responseDestination: Address, customPayload: Cell | null, forwardAmount: bigint, forwardPayload: Cell | null }
+    | { type: 'jetton-burn', queryId: bigint | null, amount: bigint, responseDestination: Address, customPayload: Cell | Buffer | null }
+    | { type: 'add-whitelist', queryId: bigint | null, address: Address }
+    | { type: 'single-nominator-withdraw', queryId: bigint | null, amount: bigint }
+    | { type: 'single-nominator-change-validator', queryId: bigint | null, address: Address }
+    | { type: 'tonstakers-deposit', queryId: bigint | null, appId: bigint | null }
+    | { type: 'vote-for-proposal', queryId: bigint | null, votingAddress: Address, expirationDate: number, vote: boolean, needConfirmation: boolean }
+    | { type: 'change-dns-record', queryId: bigint | null, record: { type: 'wallet', value: { address: Address, capabilities: { isWallet: boolean } | null } | null } | { type: 'unknown', key: Buffer, value: Cell | null } }
+    | { type: 'token-bridge-pay-swap', queryId: bigint | null, swapId: Buffer }
 
 export type SignDataRequest =
     | { type: 'plaintext', text: string }
@@ -45,6 +56,363 @@ function processAddressFlags(opts?: { testOnly?: boolean, bounceable?: boolean, 
     }
 
     return { bounceable, testOnly, chain, flags };
+}
+
+function convertPayload(input: TonPayloadFormat | undefined): { payload: Cell | null, hints: Buffer } {
+    let payload: Cell | null = null;
+    let hints: Buffer = Buffer.concat([writeUint8(0)]);
+
+    if (input === undefined) {
+        return {
+            payload,
+            hints,
+        };
+    }
+
+    switch (input.type) {
+        case 'unsafe': {
+            payload = input.message;
+            break;
+        }
+        case 'comment': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x00),
+                writeUint16(Buffer.from(input.text).length),
+                Buffer.from(input.text)
+            ]);
+            payload = beginCell()
+                .storeUint(0, 32)
+                .storeBuffer(Buffer.from(input.text))
+                .endCell();
+            break;
+        }
+        case 'jetton-transfer':
+        case 'nft-transfer': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(input.type === 'jetton-transfer' ? 0x01 : 0x02)
+            ]);
+
+            let b = beginCell()
+                .storeUint(input.type === 'jetton-transfer' ? 0x0f8a7ea5 : 0x5fcc3d14, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            if (input.type === 'jetton-transfer') {
+                d = Buffer.concat([d, writeVarUInt(input.amount)]);
+                b = b.storeCoins(input.amount);
+
+                d = Buffer.concat([d, writeAddress(input.destination)]);
+                b = b.storeAddress(input.destination);
+            } else {
+                d = Buffer.concat([d, writeAddress(input.newOwner)]);
+                b = b.storeAddress(input.newOwner);
+            }
+
+            d = Buffer.concat([d, writeAddress(input.responseDestination)]);
+            b = b.storeAddress(input.responseDestination);
+
+            if (input.customPayload !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeCellRef(input.customPayload)]);
+                b = b.storeMaybeRef(input.customPayload);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeMaybeRef(input.customPayload);
+            }
+
+            d = Buffer.concat([d, writeVarUInt(input.forwardAmount)]);
+            b = b.storeCoins(input.forwardAmount);
+
+            if (input.forwardPayload !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeCellRef(input.forwardPayload)]);
+                b = b.storeMaybeRef(input.forwardPayload);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeMaybeRef(input.forwardPayload);
+            }
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'jetton-burn': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x03)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x595f07bc, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            d = Buffer.concat([d, writeVarUInt(input.amount)]);
+            b = b.storeCoins(input.amount);
+
+            d = Buffer.concat([d, writeAddress(input.responseDestination)]);
+            b = b.storeAddress(input.responseDestination);
+
+            if (input.customPayload === null) {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeMaybeRef(input.customPayload);
+            } else if (input.customPayload instanceof Cell) {
+                d = Buffer.concat([d, writeUint8(1), writeCellRef(input.customPayload)]);
+                b = b.storeMaybeRef(input.customPayload);
+            } else {
+                d = Buffer.concat([d, writeUint8(2), writeCellInline(input.customPayload)]);
+                b = b.storeMaybeRef(beginCell().storeBuffer(input.customPayload).endCell());
+            }
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'add-whitelist':
+        case 'single-nominator-change-validator': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(input.type === 'add-whitelist' ? 0x04 : 0x06)
+            ]);
+
+            let b = beginCell()
+                .storeUint(input.type === 'add-whitelist' ? 0x7258a69b : 0x1001, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            d = Buffer.concat([d, writeAddress(input.address)]);
+            b = b.storeAddress(input.address);
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'single-nominator-withdraw': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x05)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x1000, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            d = Buffer.concat([d, writeVarUInt(input.amount)]);
+            b = b.storeCoins(input.amount);
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'tonstakers-deposit': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x07)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x47d54391, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            if (input.appId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.appId)]);
+                b = b.storeUint(input.appId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+            }
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'vote-for-proposal': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x08)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x69fb306c, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            d = Buffer.concat([d, writeAddress(input.votingAddress)]);
+            b = b.storeAddress(input.votingAddress);
+
+            d = Buffer.concat([d, writeUint48(input.expirationDate)]);
+            b = b.storeUint(input.expirationDate, 48);
+
+            d = Buffer.concat([d, writeUint8(input.vote ? 1 : 0), writeUint8(input.needConfirmation ? 1 : 0)]);
+            b = b.storeBit(input.vote).storeBit(input.needConfirmation);
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'change-dns-record': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x09)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x4eb1f0f9, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            if (input.record.type === 'unknown' && input.record.key.length !== 32) {
+                throw new Error('DNS record key length must be 32 bytes long');
+            }
+            b = b.storeBuffer(input.record.type === 'wallet' ? sha256_sync('wallet') : input.record.key);
+
+            d = Buffer.concat([d, writeUint8(input.record.value === null ? 0 : 1), writeUint8(input.record.type === 'wallet' ? 0 : 1)]);
+
+            if (input.record.type === 'wallet') {
+                if (input.record.value !== null) {
+                    d = Buffer.concat([d, writeAddress(input.record.value.address), writeUint8(input.record.value.capabilities === null ? 0 : 1)]);
+                    let rb = beginCell().storeUint(0x9fd3, 16).storeAddress(input.record.value.address).storeUint(input.record.value.capabilities === null ? 0 : 1, 8);
+                    if (input.record.value.capabilities !== null) {
+                        d = Buffer.concat([d, writeUint8(input.record.value.capabilities.isWallet ? 1 : 0)]);
+                        if (input.record.value.capabilities.isWallet) {
+                            rb = rb.storeBit(true).storeUint(0x2177, 16);
+                        }
+                        rb = rb.storeBit(false);
+                    }
+                    b = b.storeRef(rb);
+                }
+            } else {
+                d = Buffer.concat([d, input.record.key]);
+                if (input.record.value !== null) {
+                    d = Buffer.concat([d, writeCellRef(input.record.value)]);
+                    b = b.storeRef(input.record.value);
+                }
+            }
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'token-bridge-pay-swap': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x0A)
+            ]);
+
+            let b = beginCell()
+                .storeUint(8, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            if (input.swapId.length !== 32) {
+                throw new Error('Token bridge swap ID must be 32 bytes long');
+            }
+
+            d = Buffer.concat([d, input.swapId]);
+            b = b.storeBuffer(input.swapId);
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        default: {
+            throw new Error('Unknown payload type: ' + (input as any).type);
+        }
+    }
+
+    return {
+        payload,
+        hints,
+    };
 }
 
 export class TonTransport {
@@ -280,7 +648,11 @@ export class TonTransport {
             bounce: boolean,
             amount: bigint,
             stateInit?: StateInit,
-            payload?: TonPayloadFormat
+            payload?: TonPayloadFormat,
+            walletSpecifiers?: {
+                subwalletId?: number,
+                includeWalletOp: boolean,
+            },
         }
     ) => {
 
@@ -298,7 +670,19 @@ export class TonTransport {
         //
 
         let pkg = Buffer.concat([
-            writeUint8(0), // Header
+            writeUint8(transaction.walletSpecifiers === undefined ? 0 : 1), // tag
+        ]);
+
+        if (transaction.walletSpecifiers !== undefined) {
+            pkg = Buffer.concat([
+                pkg,
+                writeUint32(transaction.walletSpecifiers.subwalletId ?? DEFAULT_SUBWALLET_ID),
+                writeUint8(transaction.walletSpecifiers.includeWalletOp ? 1 : 0),
+            ]);
+        }
+
+        pkg = Buffer.concat([
+            pkg,
             writeUint32(transaction.seqno),
             writeUint32(transaction.timeout),
             writeVarUInt(transaction.amount),
@@ -333,83 +717,7 @@ export class TonTransport {
         // Payload
         //
 
-        let payload: Cell | null = null;
-        let hints: Buffer = Buffer.concat([writeUint8(0)]);
-        if (transaction.payload) {
-            if (transaction.payload.type === 'comment') {
-                hints = Buffer.concat([
-                    writeUint8(1),
-                    writeUint32(0x00),
-                    writeUint16(Buffer.from(transaction.payload.text).length),
-                    Buffer.from(transaction.payload.text)
-                ]);
-                payload = beginCell()
-                    .storeUint(0, 32)
-                    .storeBuffer(Buffer.from(transaction.payload.text))
-                    .endCell()
-            } else if (transaction.payload.type === 'jetton-transfer' || transaction.payload.type === 'nft-transfer') {
-                hints = Buffer.concat([
-                    writeUint8(1),
-                    writeUint32(transaction.payload.type === 'jetton-transfer' ? 0x01 : 0x02)
-                ]);
-
-                let b = beginCell()
-                    .storeUint(transaction.payload.type === 'jetton-transfer' ? 0x0f8a7ea5 : 0x5fcc3d14, 32);
-                let d = Buffer.alloc(0);
-
-                if (transaction.payload.queryId !== null) {
-                    d = Buffer.concat([d, writeUint8(1), writeUint64(transaction.payload.queryId)]);
-                    b = b.storeUint(transaction.payload.queryId, 64);
-                } else {
-                    d = Buffer.concat([d, writeUint8(0)]);
-                    b = b.storeUint(0, 64);
-                }
-
-                if (transaction.payload.type === 'jetton-transfer') {
-                    d = Buffer.concat([d, writeVarUInt(transaction.payload.amount)]);
-                    b = b.storeCoins(transaction.payload.amount);
-
-                    d = Buffer.concat([d, writeAddress(transaction.payload.destination)]);
-                    b = b.storeAddress(transaction.payload.destination);
-                } else {
-                    d = Buffer.concat([d, writeAddress(transaction.payload.newOwner)]);
-                    b = b.storeAddress(transaction.payload.newOwner);
-                }
-
-                d = Buffer.concat([d, writeAddress(transaction.payload.responseDestination)]);
-                b = b.storeAddress(transaction.payload.responseDestination);
-
-                if (transaction.payload.customPayload !== null) {
-                    d = Buffer.concat([d, writeUint8(1), writeCellRef(transaction.payload.customPayload)]);
-                    b = b.storeMaybeRef(transaction.payload.customPayload);
-                } else {
-                    d = Buffer.concat([d, writeUint8(0)]);
-                    b = b.storeMaybeRef(transaction.payload.customPayload);
-                }
-
-                d = Buffer.concat([d, writeVarUInt(transaction.payload.forwardAmount)]);
-                b = b.storeCoins(transaction.payload.forwardAmount);
-
-                if (transaction.payload.forwardPayload !== null) {
-                    d = Buffer.concat([d, writeUint8(1), writeCellRef(transaction.payload.forwardPayload)]);
-                    b = b.storeMaybeRef(transaction.payload.forwardPayload);
-                } else {
-                    d = Buffer.concat([d, writeUint8(0)]);
-                    b = b.storeMaybeRef(transaction.payload.forwardPayload);
-                }
-
-                payload = b.endCell();
-                hints = Buffer.concat([
-                    hints,
-                    writeUint16(d.length),
-                    d
-                ])
-            }
-        }
-
-        //
-        // Serialize payload
-        //
+        const { payload, hints } = convertPayload(transaction.payload);
 
         if (payload) {
             pkg = Buffer.concat([
@@ -478,12 +786,16 @@ export class TonTransport {
         }
 
         // Transfer message
-        let transfer = beginCell()
-            .storeUint(698983191, 32)
+        let transferB = beginCell()
+            .storeUint(transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID, 32)
             .storeUint(transaction.timeout, 32)
-            .storeUint(transaction.seqno, 32)
-            .storeUint(0, 8)
-            .storeUint(transaction.sendMode, 8)
+            .storeUint(transaction.seqno, 32);
+
+        if (transaction.walletSpecifiers?.includeWalletOp ?? true) {
+            transferB = transferB.storeUint(0, 8)
+        }
+
+        let transfer = transferB.storeUint(transaction.sendMode, 8)
             .storeRef(orderBuilder.endCell())
             .endCell();
 
