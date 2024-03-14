@@ -12,6 +12,7 @@ const INS_ADDRESS = 0x05;
 const INS_SIGN_TX = 0x06;
 const INS_PROOF = 0x08;
 const INS_SIGN_DATA = 0x09;
+const INS_SETTINGS = 0x0A;
 
 const DEFAULT_SUBWALLET_ID = 698983191;
 
@@ -28,6 +29,328 @@ export type TonPayloadFormat =
     | { type: 'vote-for-proposal', queryId: bigint | null, votingAddress: Address, expirationDate: number, vote: boolean, needConfirmation: boolean }
     | { type: 'change-dns-record', queryId: bigint | null, record: { type: 'wallet', value: { address: Address, capabilities: { isWallet: boolean } | null } | null } | { type: 'unknown', key: Buffer, value: Cell | null } }
     | { type: 'token-bridge-pay-swap', queryId: bigint | null, swapId: Buffer }
+
+const dnsWalletKey = Buffer.from([0xe8, 0xd4, 0x40, 0x50, 0x87, 0x3d, 0xba, 0x86, 0x5a, 0xa7, 0xc1, 0x70, 0xab, 0x4c, 0xce, 0x64,
+                                  0xd9, 0x08, 0x39, 0xa3, 0x4d, 0xcf, 0xd6, 0xcf, 0x71, 0xd1, 0x4e, 0x02, 0x05, 0x44, 0x3b, 0x1b]);
+
+function normalizeQueryId(qid: bigint): bigint | null {
+    return qid === 0n ? null : qid;
+}
+
+export function parseMessage(cell: Cell, opts?: { disallowUnsafe?: boolean, disallowModification?: boolean, encodeJettonBurnEthAddressAsHex?: boolean }): TonPayloadFormat | undefined {
+    const params = {
+        disallowUnsafe: false,
+        disallowModification: false,
+        encodeJettonBurnEthAddressAsHex: true,
+        ...opts,
+    };
+
+    if (cell.hash().equals(new Cell().hash())) {
+        return undefined;
+    }
+
+    let s = cell.beginParse();
+    try {
+        const op = s.loadUint(32);
+        switch (op) {
+            case 0: {
+                const str = s.loadStringTail();
+                s.endParse();
+
+                if (str.length > 120) {
+                    throw new Error('Comment must be at most 120 ASCII characters long');
+                }
+
+                for (const c of str) {
+                    if (c.charCodeAt(0) < 0x20 || c.charCodeAt(0) >= 0x7f) {
+                        throw new Error('Comment must only contain printable ASCII characters');
+                    }
+                }
+
+                return {
+                    type: 'comment',
+                    text: str,
+                };
+            }
+            case 0x0f8a7ea5: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const amount = s.loadCoins();
+                const destination = s.loadAddress();
+                const responseDestination = s.loadAddress();
+                const customPayload = s.loadMaybeRef();
+                const forwardAmount = s.loadCoins();
+
+                let forwardPayload: Cell | null = null;
+                if (s.loadBit()) {
+                    forwardPayload = s.loadRef();
+                } else {
+                    const p = s.asCell();
+                    s = new Cell().beginParse(); // clear the slice
+                    if (!p.hash().equals(new Cell().hash())) {
+                        if (params.disallowModification) {
+                            throw new Error('Jetton transfer message would be modified');
+                        }
+                        forwardPayload = p;
+                    }
+                }
+
+                s.endParse();
+
+                return {
+                    type: 'jetton-transfer',
+                    queryId,
+                    amount,
+                    destination,
+                    responseDestination,
+                    customPayload,
+                    forwardAmount,
+                    forwardPayload,
+                };
+            }
+            case 0x5fcc3d14: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const newOwner = s.loadAddress();
+                const responseDestination = s.loadAddress();
+                const customPayload = s.loadMaybeRef();
+                const forwardAmount = s.loadCoins();
+
+                let forwardPayload: Cell | null = null;
+                if (s.loadBit()) {
+                    forwardPayload = s.loadRef();
+                } else {
+                    const p = s.asCell();
+                    s = new Cell().beginParse(); // clear the slice
+                    if (!p.hash().equals(new Cell().hash())) {
+                        if (params.disallowModification) {
+                            throw new Error('Jetton transfer message would be modified');
+                        }
+                        forwardPayload = p;
+                    }
+                }
+
+                s.endParse();
+
+                return {
+                    type: 'nft-transfer',
+                    queryId,
+                    newOwner,
+                    responseDestination,
+                    customPayload,
+                    forwardAmount,
+                    forwardPayload,
+                };
+            }
+            case 0x595f07bc: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const amount = s.loadCoins();
+                const responseDestination = s.loadAddress();
+                let customPayload: Cell | Buffer | null = s.loadMaybeRef();
+                s.endParse();
+
+                if (params.encodeJettonBurnEthAddressAsHex && customPayload !== null && customPayload.bits.length === 160 && customPayload.refs.length === 0) {
+                    const cs = customPayload.beginParse();
+                    customPayload = cs.loadBuffer(20);
+                    cs.endParse();
+                }
+
+                return {
+                    type: 'jetton-burn',
+                    queryId,
+                    amount,
+                    responseDestination,
+                    customPayload,
+                };
+            }
+            case 0x7258a69b: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const address = s.loadAddress();
+                s.endParse();
+
+                return {
+                    type: 'add-whitelist',
+                    queryId,
+                    address,
+                };
+            }
+            case 0x1000: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const amount = s.loadCoins();
+                s.endParse();
+
+                return {
+                    type: 'single-nominator-withdraw',
+                    queryId,
+                    amount,
+                };
+            }
+            case 0x1001: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const address = s.loadAddress();
+                s.endParse();
+
+                return {
+                    type: 'single-nominator-change-validator',
+                    queryId,
+                    address,
+                };
+            }
+            case 0x47d54391: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                let appId: bigint | null = null;
+                if (s.remainingBits > 0) {
+                    appId = s.loadUintBig(64);
+                }
+                s.endParse();
+
+                return {
+                    type: 'tonstakers-deposit',
+                    queryId,
+                    appId,
+                };
+            }
+            case 0x69fb306c: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const votingAddress = s.loadAddress();
+                const expirationDate = s.loadUint(48);
+                const vote = s.loadBit();
+                const needConfirmation = s.loadBit();
+                s.endParse();
+
+                return {
+                    type: 'vote-for-proposal',
+                    queryId,
+                    votingAddress,
+                    expirationDate,
+                    vote,
+                    needConfirmation,
+                };
+            }
+            case 0x4eb1f0f9: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const key = s.loadBuffer(32);
+
+                if (key.equals(dnsWalletKey)) {
+                    if (s.remainingRefs > 0) {
+                        const vs = s.loadRef().beginParse();
+                        if (s.remainingBits > 0 && !params.disallowModification) {
+                            // tolerate the Maybe bit
+                            if (!s.loadBit()) throw new Error('Incorrect change DNS record message');
+                        }
+                        s.endParse();
+
+                        const type = vs.loadUint(16);
+                        if (type !== 0x9fd3) {
+                            throw new Error('Wrong DNS record type');
+                        }
+
+                        const address = vs.loadAddress();
+                        const flags = vs.loadUint(8);
+                        if (flags > 1) {
+                            throw new Error('DNS wallet record must have flags 0 or 1');
+                        }
+                        let capabilities: { isWallet: boolean } | null = (flags & 1) > 0 ? { isWallet: false } : null;
+                        if (capabilities !== null) {
+                            while (vs.loadBit()) {
+                                const cap = vs.loadUint(16);
+                                if (cap === 0x2177) {
+                                    if (capabilities.isWallet && params.disallowModification) {
+                                        throw new Error('DNS change record message would be modified');
+                                    }
+                                    capabilities.isWallet = true;
+                                } else {
+                                    throw new Error('Unknown DNS wallet record capability');
+                                }
+                            }
+                        }
+
+                        return {
+                            type: 'change-dns-record',
+                            queryId,
+                            record: {
+                                type: 'wallet',
+                                value: {
+                                    address,
+                                    capabilities,
+                                },
+                            },
+                        };
+                    } else {
+                        if (s.remainingBits > 0 && !params.disallowModification) {
+                            // tolerate the Maybe bit
+                            if (s.loadBit()) throw new Error('Incorrect change DNS record message');
+                        }
+                        s.endParse();
+
+                        return {
+                            type: 'change-dns-record',
+                            queryId,
+                            record: {
+                                type: 'wallet',
+                                value: null,
+                            },
+                        };
+                    }
+                } else {
+                    if (s.remainingRefs > 0) {
+                        const value = s.loadRef();
+                        if (s.remainingBits > 0 && !params.disallowModification) {
+                            // tolerate the Maybe bit
+                            if (!s.loadBit()) throw new Error('Incorrect change DNS record message');
+                        }
+                        s.endParse();
+
+                        return {
+                            type: 'change-dns-record',
+                            queryId,
+                            record: {
+                                type: 'unknown',
+                                key,
+                                value,
+                            },
+                        };
+                    } else {
+                        if (s.remainingBits > 0 && !params.disallowModification) {
+                            // tolerate the Maybe bit
+                            if (s.loadBit()) throw new Error('Incorrect change DNS record message');
+                        }
+                        s.endParse();
+
+                        return {
+                            type: 'change-dns-record',
+                            queryId,
+                            record: {
+                                type: 'unknown',
+                                key,
+                                value: null,
+                            },
+                        };
+                    }
+                }
+            }
+            case 0x8: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const swapId = s.loadBuffer(32);
+                s.endParse();
+
+                return {
+                    type: 'token-bridge-pay-swap',
+                    queryId,
+                    swapId,
+                };
+            }
+        }
+        throw new Error('Unknown op: ' + op);
+    } catch (e) {
+        if (params.disallowUnsafe) {
+            throw e;
+        }
+    }
+
+    return {
+        type: 'unsafe',
+        message: cell,
+    };
+}
 
 export type SignDataRequest =
     | { type: 'plaintext', text: string }
@@ -814,6 +1137,17 @@ export class TonTransport {
             .storeBuffer(signature)
             .storeSlice(transfer.beginParse())
             .endCell();
+    }
+
+    async getSettings(): Promise<{
+        blindSigningEnabled: boolean
+        expertMode: boolean
+    }> {
+        let loaded = await this.#doRequest(INS_SETTINGS, 0x00, 0x00, Buffer.alloc(0));
+        return {
+            blindSigningEnabled: (loaded[0] & 0x01) > 0,
+            expertMode: (loaded[0] & 0x02) > 0,
+        };
     }
 
     #doRequest = async (ins: number, p1: number, p2: number, data: Buffer) => {

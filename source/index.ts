@@ -1,1 +1,1 @@
-export { TonPayloadFormat, TonTransport, SignDataRequest } from './TonTransport';
+export { TonPayloadFormat, TonTransport, SignDataRequest, parseMessage } from './TonTransport';
