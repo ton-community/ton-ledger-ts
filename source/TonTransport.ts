@@ -46,6 +46,10 @@ export const KNOWN_JETTONS: KnownJetton[] = [
         symbol: 'stTON',
         masterAddress: Address.parse('EQDNhy-nxYFgUqzfUzImBEP67JqsyMIcyk2S5_RwNNEYku0k'),
     },
+    {
+        symbol: 'STAKED',
+        masterAddress: Address.parse('EQCqC6EhRJ_tpWngKxL6dV0k6DSnRUrs9GSVkLbfdCqsj6TE'),
+    },
 ];
 
 export type TonPayloadFormat =
