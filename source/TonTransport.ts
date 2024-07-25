@@ -16,10 +16,42 @@ const INS_SETTINGS = 0x0A;
 
 const DEFAULT_SUBWALLET_ID = 698983191;
 
+export type KnownJetton = {
+    symbol: string;
+    masterAddress: Address;
+};
+
+export const KNOWN_JETTONS: KnownJetton[] = [
+    {
+        symbol: 'USDT',
+        masterAddress: Address.parse('EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs'),
+    },
+    {
+        symbol: 'NOT',
+        masterAddress: Address.parse('EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT'),
+    },
+    {
+        symbol: 'tsTON',
+        masterAddress: Address.parse('EQC98_qAmNEptUtPc7W6xdHh_ZHrBUFpw5Ft_IzNU20QAJav'),
+    },
+    {
+        symbol: 'wsTON',
+        masterAddress: Address.parse('EQB0SoxuGDx5qjVt0P_bPICFeWdFLBmVopHhjgfs0q-wsTON'),
+    },
+    {
+        symbol: 'hTON',
+        masterAddress: Address.parse('EQDPdq8xjAhytYqfGSX8KcFWIReCufsB9Wdg0pLlYSO_h76w'),
+    },
+    {
+        symbol: 'stTON',
+        masterAddress: Address.parse('EQDNhy-nxYFgUqzfUzImBEP67JqsyMIcyk2S5_RwNNEYku0k'),
+    },
+];
+
 export type TonPayloadFormat =
     | { type: 'unsafe', message: Cell }
     | { type: 'comment', text: string }
-    | { type: 'jetton-transfer', queryId: bigint | null, amount: bigint, destination: Address, responseDestination: Address, customPayload: Cell | null, forwardAmount: bigint, forwardPayload: Cell | null }
+    | { type: 'jetton-transfer', queryId: bigint | null, amount: bigint, destination: Address, responseDestination: Address, customPayload: Cell | null, forwardAmount: bigint, forwardPayload: Cell | null, knownJetton: { jettonId: number, workchain: number } | null }
     | { type: 'nft-transfer', queryId: bigint | null, newOwner: Address, responseDestination: Address, customPayload: Cell | null, forwardAmount: bigint, forwardPayload: Cell | null }
     | { type: 'jetton-burn', queryId: bigint | null, amount: bigint, responseDestination: Address, customPayload: Cell | Buffer | null }
     | { type: 'add-whitelist', queryId: bigint | null, address: Address }
@@ -105,6 +137,7 @@ export function parseMessage(cell: Cell, opts?: { disallowUnsafe?: boolean, disa
                     customPayload,
                     forwardAmount,
                     forwardPayload,
+                    knownJetton: null,
                 };
             }
             case 0x5fcc3d14: {
@@ -365,10 +398,13 @@ function chunks(buf: Buffer, n: number): Buffer[] {
     return cs;
 }
 
-function processAddressFlags(opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number }): { testOnly: boolean, bounceable: boolean, chain: number, flags: number } {
+function processAddressFlags(opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }): { testOnly: boolean, bounceable: boolean, chain: number, flags: number, specifiers?: { subwalletId: number, isV3R2: boolean } } {
     const bounceable = opts?.bounceable ?? true;
     const testOnly = opts?.testOnly ?? false;
     const chain = opts?.chain ?? 0;
+    const subwalletId = opts?.subwalletId ?? 698983191;
+    const walletVersion = opts?.walletVersion ?? 'v3r2';
+    let specifiers: { subwalletId: number, isV3R2: boolean } | undefined = undefined;
 
     let flags = 0x00;
     if (testOnly) {
@@ -377,8 +413,15 @@ function processAddressFlags(opts?: { testOnly?: boolean, bounceable?: boolean, 
     if (chain === -1) {
         flags |= 0x02;
     }
+    if (subwalletId !== 698983191 || walletVersion !== 'v4') {
+        flags |= 0x04;
+        specifiers = {
+            subwalletId,
+            isV3R2: walletVersion === 'v3r2',
+        };
+    }
 
-    return { bounceable, testOnly, chain, flags };
+    return { bounceable, testOnly, chain, flags, specifiers };
 }
 
 function convertPayload(input: TonPayloadFormat | undefined): { payload: Cell | null, hints: Buffer } {
@@ -421,15 +464,28 @@ function convertPayload(input: TonPayloadFormat | undefined): { payload: Cell | 
                 .storeUint(input.type === 'jetton-transfer' ? 0x0f8a7ea5 : 0x5fcc3d14, 32);
             let d = Buffer.alloc(0);
 
+            let flags = 0;
             if (input.queryId !== null) {
-                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                flags |= 1;
+            }
+            if (input.type === 'jetton-transfer' && input.knownJetton !== null) {
+                flags |= 2;
+            }
+
+            d = Buffer.concat([d, writeUint8(flags)]);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint64(input.queryId)]);
                 b = b.storeUint(input.queryId, 64);
             } else {
-                d = Buffer.concat([d, writeUint8(0)]);
                 b = b.storeUint(0, 64);
             }
 
             if (input.type === 'jetton-transfer') {
+                if (input.knownJetton !== null) {
+                    d = Buffer.concat([d, writeUint16(input.knownJetton.jettonId), writeUint8(input.knownJetton.workchain)]);
+                }
+
                 d = Buffer.concat([d, writeVarUInt(input.amount)]);
                 b = b.storeCoins(input.amount);
 
@@ -786,13 +842,13 @@ export class TonTransport {
     // Operations
     //
 
-    async getAddress(path: number[], opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number }) {
+    async getAddress(path: number[], opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }) {
 
         // Check path
         validatePath(path);
 
         // Resolve flags
-        const { bounceable, testOnly, chain } = processAddressFlags(opts);
+        const { bounceable, testOnly, chain, specifiers } = processAddressFlags(opts);
 
         // Get public key
         let response = await this.#doRequest(INS_ADDRESS, 0x00, 0x00, pathElementsToBuffer(path.map((v) => v + 0x80000000)));
@@ -801,34 +857,39 @@ export class TonTransport {
         }
 
         // Contract
-        const contract = getInit(chain, response);
+        const contract = getInit(response, specifiers?.subwalletId ?? 698983191, specifiers?.isV3R2 ?? false);
         const address = contractAddress(chain, contract);
 
         return { address: address.toString({ bounceable, testOnly }), publicKey: response };
     }
 
-    async validateAddress(path: number[], opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number }) {
+    async validateAddress(path: number[], opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }) {
 
         // Check path
         validatePath(path);
 
         // Resolve flags
-        const { bounceable, testOnly, chain, flags } = processAddressFlags(opts);
+        const { bounceable, testOnly, chain, flags, specifiers } = processAddressFlags(opts);
+
+        let r = pathElementsToBuffer(path.map((v) => v + 0x80000000));
+        if (specifiers !== undefined) {
+            r = Buffer.concat([r, writeUint8(specifiers.isV3R2 ? 1 : 0), writeUint32(specifiers.subwalletId)]);
+        }
 
         // Get public key
-        let response = await this.#doRequest(INS_ADDRESS, 0x01, flags, pathElementsToBuffer(path.map((v) => v + 0x80000000)));
+        let response = await this.#doRequest(INS_ADDRESS, 0x01, flags, r);
         if (response.length !== 32) {
             throw Error('Invalid response');
         }
 
         // Contract
-        const contract = getInit(chain, response);
+        const contract = getInit(response, specifiers?.subwalletId ?? 698983191, specifiers?.isV3R2 ?? false);
         const address = contractAddress(chain, contract);
 
         return { address: address.toString({ bounceable, testOnly }), publicKey: response };
     }
 
-    async getAddressProof(path: number[], params: { domain: string, timestamp: number, payload: Buffer }, opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number }) {
+    async getAddressProof(path: number[], params: { domain: string, timestamp: number, payload: Buffer }, opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }) {
 
         // Check path
         validatePath(path);
@@ -836,11 +897,17 @@ export class TonTransport {
         let publicKey = (await this.getAddress(path)).publicKey;
 
         // Resolve flags
-        const { flags } = processAddressFlags(opts);
+        const { flags, specifiers } = processAddressFlags(opts);
+
+        let specifiersBuf = Buffer.alloc(0);
+        if (specifiers !== undefined) {
+            specifiersBuf = Buffer.concat([writeUint8(specifiers.isV3R2 ? 1 : 0), writeUint32(specifiers.subwalletId)]);
+        }
 
         const domainBuf = Buffer.from(params.domain, 'utf-8');
         const reqBuf = Buffer.concat([
             pathElementsToBuffer(path.map((v) => v + 0x80000000)),
+            specifiersBuf,
             writeUint8(domainBuf.length),
             domainBuf,
             writeUint64(BigInt(params.timestamp)),
