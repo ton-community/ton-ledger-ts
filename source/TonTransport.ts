@@ -407,7 +407,7 @@ function processAddressFlags(opts?: { testOnly?: boolean, bounceable?: boolean, 
     const testOnly = opts?.testOnly ?? false;
     const chain = opts?.chain ?? 0;
     const subwalletId = opts?.subwalletId ?? 698983191;
-    const walletVersion = opts?.walletVersion ?? 'v3r2';
+    const walletVersion = opts?.walletVersion ?? 'v4';
     let specifiers: { subwalletId: number, isV3R2: boolean } | undefined = undefined;
 
     let flags = 0x00;
