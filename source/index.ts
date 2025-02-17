@@ -1,1 +1,1 @@
-export { TonPayloadFormat, TonTransport, SignDataRequest, parseMessage, KNOWN_JETTONS } from './TonTransport';
+export { TonPayloadFormat, TonTransport, SignDataRequest, parseMessage, KnownJetton, KNOWN_JETTONS, ExtraCurrency, KNOWN_EXTRA_CURRENCIES } from './TonTransport';

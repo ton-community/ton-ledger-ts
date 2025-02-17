@@ -50,6 +50,32 @@ export const KNOWN_JETTONS: KnownJetton[] = [
         symbol: 'STAKED',
         masterAddress: Address.parse('EQCqC6EhRJ_tpWngKxL6dV0k6DSnRUrs9GSVkLbfdCqsj6TE'),
     },
+    {
+        symbol: 'CATI',
+        masterAddress: Address.parse('EQD-cvR0Nz6XAyRBvbhz-abTrRC6sI5tvHvvpeQraV9UAAD7'),
+    },
+    {
+        symbol: 'DOGS',
+        masterAddress: Address.parse('EQCvxJy4eG8hyHBFsZ7eePxrRsUQSFE_jpptRAYBmcG_DOGS'),
+    },
+    {
+        symbol: 'X',
+        masterAddress: Address.parse('EQB4zZusHsbU2vVTPqjhlokIOoiZhEdCMT703CWEzhTOo__X'),
+    },
+];
+
+export type ExtraCurrency = {
+    id: number;
+    symbol: string;
+    decimals: number;
+};
+
+export const KNOWN_EXTRA_CURRENCIES: ExtraCurrency[] = [
+    {
+        id: 1,
+        symbol: 'tgBTC',
+        decimals: 8,
+    },
 ];
 
 export type TonPayloadFormat =
@@ -1047,6 +1073,10 @@ export class TonTransport {
                 subwalletId?: number,
                 includeWalletOp: boolean,
             },
+            extraCurrency?: {
+                index: number,
+                amount: bigint,
+            },
         }
     ) => {
 
@@ -1063,15 +1093,33 @@ export class TonTransport {
         // Create package
         //
 
+        const useTag1 = transaction.walletSpecifiers !== undefined || transaction.extraCurrency !== undefined;
+
         let pkg = Buffer.concat([
-            writeUint8(transaction.walletSpecifiers === undefined ? 0 : 1), // tag
+            writeUint8(useTag1 ? 1 : 0), // tag
         ]);
 
-        if (transaction.walletSpecifiers !== undefined) {
+        if (useTag1) {
+            let flags = 0;
+            if (transaction.walletSpecifiers !== undefined && transaction.walletSpecifiers.includeWalletOp) {
+                flags |= 1;
+            }
+            if (transaction.extraCurrency !== undefined) {
+                flags |= 2;
+            }
+
             pkg = Buffer.concat([
                 pkg,
-                writeUint32(transaction.walletSpecifiers.subwalletId ?? DEFAULT_SUBWALLET_ID),
-                writeUint8(transaction.walletSpecifiers.includeWalletOp ? 1 : 0),
+                writeUint32(transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID),
+                writeUint8(flags),
+            ]);
+        }
+
+        let ecBuf = Buffer.alloc(0);
+        if (transaction.extraCurrency !== undefined) {
+            ecBuf = Buffer.concat([
+                writeUint8(transaction.extraCurrency.index),
+                writeVarUInt(transaction.extraCurrency.amount),
             ]);
         }
 
@@ -1080,6 +1128,7 @@ export class TonTransport {
             writeUint32(transaction.seqno),
             writeUint32(transaction.timeout),
             writeVarUInt(transaction.amount),
+            ecBuf,
             writeAddress(transaction.to),
             writeUint8(transaction.bounce ? 1 : 0),
             writeUint8(transaction.sendMode),
