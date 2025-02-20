@@ -1201,7 +1201,20 @@ export class TonTransport {
             .storeAddress(null)
             .storeAddress(transaction.to)
             .storeCoins(transaction.amount)
-            .storeBit(false)
+
+        if (transaction.extraCurrency !== undefined) {
+            orderBuilder
+                .storeBit(true)
+                .storeRef(beginCell()
+                    .storeUint(0b10, 2)
+                    .storeUint(32, 6)
+                    .storeUint(transaction.extraCurrency.index, 32)
+                    .storeVarUint(transaction.extraCurrency.amount, 5))
+        } else {
+            orderBuilder.storeBit(false)
+        }
+
+        orderBuilder
             .storeCoins(0)
             .storeCoins(0)
             .storeUint(0, 64)
