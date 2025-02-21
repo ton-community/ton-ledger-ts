@@ -1083,6 +1083,10 @@ export class TonTransport {
         // Check path
         validatePath(path);
 
+        if (transaction.extraCurrency !== undefined && transaction.extraCurrency.index >= KNOWN_EXTRA_CURRENCIES.length) {
+            throw Error('Invalid extra currency index');
+        }
+
         //
         // Fetch key
         //
@@ -1208,7 +1212,7 @@ export class TonTransport {
                 .storeRef(beginCell()
                     .storeUint(0b10, 2)
                     .storeUint(32, 6)
-                    .storeUint(transaction.extraCurrency.index, 32)
+                    .storeUint(KNOWN_EXTRA_CURRENCIES[transaction.extraCurrency.index].id, 32)
                     .storeVarUint(transaction.extraCurrency.amount, 5))
         } else {
             orderBuilder.storeBit(false)
