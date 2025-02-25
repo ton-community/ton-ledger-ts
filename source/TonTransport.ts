@@ -1097,6 +1097,9 @@ export class TonTransport {
         // Create package
         //
 
+        const includeWalletOp = transaction.walletSpecifiers?.includeWalletOp ?? true;
+        const subwalletId = transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID;
+
         const useTag1 = transaction.walletSpecifiers !== undefined || transaction.extraCurrency !== undefined;
 
         let pkg = Buffer.concat([
@@ -1105,7 +1108,7 @@ export class TonTransport {
 
         if (useTag1) {
             let flags = 0;
-            if (transaction.walletSpecifiers !== undefined && transaction.walletSpecifiers.includeWalletOp) {
+            if (includeWalletOp) {
                 flags |= 1;
             }
             if (transaction.extraCurrency !== undefined) {
@@ -1114,7 +1117,7 @@ export class TonTransport {
 
             pkg = Buffer.concat([
                 pkg,
-                writeUint32(transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID),
+                writeUint32(subwalletId),
                 writeUint8(flags),
             ]);
         }
@@ -1207,7 +1210,7 @@ export class TonTransport {
             .storeCoins(transaction.amount)
 
         if (transaction.extraCurrency !== undefined) {
-            orderBuilder
+            orderBuilder = orderBuilder
                 .storeBit(true)
                 .storeRef(beginCell()
                     .storeUint(0b10, 2)
@@ -1215,10 +1218,10 @@ export class TonTransport {
                     .storeUint(KNOWN_EXTRA_CURRENCIES[transaction.extraCurrency.index].id, 32)
                     .storeVarUint(transaction.extraCurrency.amount, 5))
         } else {
-            orderBuilder.storeBit(false)
+            orderBuilder = orderBuilder.storeBit(false)
         }
 
-        orderBuilder
+        orderBuilder = orderBuilder
             .storeCoins(0)
             .storeCoins(0)
             .storeUint(0, 64)
@@ -1247,11 +1250,11 @@ export class TonTransport {
 
         // Transfer message
         let transferB = beginCell()
-            .storeUint(transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID, 32)
+            .storeUint(subwalletId, 32)
             .storeUint(transaction.timeout, 32)
             .storeUint(transaction.seqno, 32);
 
-        if (transaction.walletSpecifiers?.includeWalletOp ?? true) {
+        if (includeWalletOp) {
             transferB = transferB.storeUint(0, 8)
         }
 
