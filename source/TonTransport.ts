@@ -963,7 +963,7 @@ function convertPayload(input: TonPayloadFormat | undefined): { payload: Cell | 
             if (input.text.length > 120) {
                 throw new Error('Comment must be at most 120 ASCII characters long');
             }
-            buffer = Buffer.concat([buffer, writeUint16(Buffer.from(input.text).length), Buffer.from(input.text)]);
+            buffer = Buffer.concat([buffer, writeUint8(Buffer.from(input.text).length), Buffer.from(input.text)]);
 
             payload = builder.endCell();
             hints = Buffer.concat([
