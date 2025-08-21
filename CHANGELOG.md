@@ -4,13 +4,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.1] - 2024-01-17
+## [7.2.0] - 2025-02-07
+
+- Added support for TON Ledger App 2.2.0 features, including:
+- Hardcoded jettons
+- Wallet specifiers support in more methods
+
+## [7.1.0] - Not released
+
+### Added
+
+- Added `parseMessage` helper to parse messages into TON Ledger App format
+- Added support for TON Ledger App 2.1.0 features, including:
+- New message types
+- Wallet specifiers (subwallet ID and wallet op inclusion for v4 support)
+- `getSettings` method
+
+## [7.0.1] - 2024-01-17
 
 ### Fixed
 
 - Fixed incorrect VarUInt encoding of 0 (0 nanoTON, 0 jetton units, etc)
 
-## [0.7.0] - 2023-09-15
+## [7.0.0] - 2023-09-15
 
 ### Changed
 

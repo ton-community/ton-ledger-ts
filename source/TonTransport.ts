@@ -1,8 +1,8 @@
 import Transport from "@ledgerhq/hw-transport";
 import { Address, beginCell, Cell, contractAddress, SendMode, StateInit, storeStateInit } from "@ton/core";
-import { signVerify } from '@ton/crypto';
+import { sha256_sync, signVerify } from '@ton/crypto';
 import { AsyncLock } from 'teslabot';
-import { writeAddress, writeCellRef, writeUint16, writeUint32, writeUint64, writeUint8, writeVarUInt } from "./utils/ledgerWriter";
+import { writeAddress, writeCellInline, writeCellRef, writeUint16, writeUint32, writeUint48, writeUint64, writeUint8, writeVarUInt } from "./utils/ledgerWriter";
 import { getInit } from "./utils/getInit";
 
 const LEDGER_SYSTEM = 0xB0;
@@ -12,11 +12,382 @@ const INS_ADDRESS = 0x05;
 const INS_SIGN_TX = 0x06;
 const INS_PROOF = 0x08;
 const INS_SIGN_DATA = 0x09;
+const INS_SETTINGS = 0x0A;
+
+const DEFAULT_SUBWALLET_ID = 698983191;
+
+export type KnownJetton = {
+    symbol: string;
+    masterAddress: Address;
+};
+
+export const KNOWN_JETTONS: KnownJetton[] = [
+    {
+        symbol: 'USDT',
+        masterAddress: Address.parse('EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs'),
+    },
+    {
+        symbol: 'NOT',
+        masterAddress: Address.parse('EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT'),
+    },
+    {
+        symbol: 'tsTON',
+        masterAddress: Address.parse('EQC98_qAmNEptUtPc7W6xdHh_ZHrBUFpw5Ft_IzNU20QAJav'),
+    },
+    {
+        symbol: 'wsTON',
+        masterAddress: Address.parse('EQB0SoxuGDx5qjVt0P_bPICFeWdFLBmVopHhjgfs0q-wsTON'),
+    },
+    {
+        symbol: 'hTON',
+        masterAddress: Address.parse('EQDPdq8xjAhytYqfGSX8KcFWIReCufsB9Wdg0pLlYSO_h76w'),
+    },
+    {
+        symbol: 'stTON',
+        masterAddress: Address.parse('EQDNhy-nxYFgUqzfUzImBEP67JqsyMIcyk2S5_RwNNEYku0k'),
+    },
+    {
+        symbol: 'STAKED',
+        masterAddress: Address.parse('EQCqC6EhRJ_tpWngKxL6dV0k6DSnRUrs9GSVkLbfdCqsj6TE'),
+    },
+];
 
 export type TonPayloadFormat =
+    | { type: 'unsafe', message: Cell }
     | { type: 'comment', text: string }
-    | { type: 'jetton-transfer', queryId: bigint | null, amount: bigint, destination: Address, responseDestination: Address, customPayload: Cell | null, forwardAmount: bigint, forwardPayload: Cell | null }
+    | { type: 'jetton-transfer', queryId: bigint | null, amount: bigint, destination: Address, responseDestination: Address, customPayload: Cell | null, forwardAmount: bigint, forwardPayload: Cell | null, knownJetton: { jettonId: number, workchain: number } | null }
     | { type: 'nft-transfer', queryId: bigint | null, newOwner: Address, responseDestination: Address, customPayload: Cell | null, forwardAmount: bigint, forwardPayload: Cell | null }
+    | { type: 'jetton-burn', queryId: bigint | null, amount: bigint, responseDestination: Address, customPayload: Cell | Buffer | null }
+    | { type: 'add-whitelist', queryId: bigint | null, address: Address }
+    | { type: 'single-nominator-withdraw', queryId: bigint | null, amount: bigint }
+    | { type: 'single-nominator-change-validator', queryId: bigint | null, address: Address }
+    | { type: 'tonstakers-deposit', queryId: bigint | null, appId: bigint | null }
+    | { type: 'vote-for-proposal', queryId: bigint | null, votingAddress: Address, expirationDate: number, vote: boolean, needConfirmation: boolean }
+    | { type: 'change-dns-record', queryId: bigint | null, record: { type: 'wallet', value: { address: Address, capabilities: { isWallet: boolean } | null } | null } | { type: 'unknown', key: Buffer, value: Cell | null } }
+    | { type: 'token-bridge-pay-swap', queryId: bigint | null, swapId: Buffer }
+
+const dnsWalletKey = Buffer.from([0xe8, 0xd4, 0x40, 0x50, 0x87, 0x3d, 0xba, 0x86, 0x5a, 0xa7, 0xc1, 0x70, 0xab, 0x4c, 0xce, 0x64,
+                                  0xd9, 0x08, 0x39, 0xa3, 0x4d, 0xcf, 0xd6, 0xcf, 0x71, 0xd1, 0x4e, 0x02, 0x05, 0x44, 0x3b, 0x1b]);
+
+function normalizeQueryId(qid: bigint): bigint | null {
+    return qid === 0n ? null : qid;
+}
+
+export function parseMessage(cell: Cell, opts?: { disallowUnsafe?: boolean, disallowModification?: boolean, encodeJettonBurnEthAddressAsHex?: boolean }): TonPayloadFormat | undefined {
+    const params = {
+        disallowUnsafe: false,
+        disallowModification: false,
+        encodeJettonBurnEthAddressAsHex: true,
+        ...opts,
+    };
+
+    if (cell.hash().equals(new Cell().hash())) {
+        return undefined;
+    }
+
+    let s = cell.beginParse();
+    try {
+        const op = s.loadUint(32);
+        switch (op) {
+            case 0: {
+                const str = s.loadStringTail();
+                s.endParse();
+
+                if (str.length > 120) {
+                    throw new Error('Comment must be at most 120 ASCII characters long');
+                }
+
+                for (const c of str) {
+                    if (c.charCodeAt(0) < 0x20 || c.charCodeAt(0) >= 0x7f) {
+                        throw new Error('Comment must only contain printable ASCII characters');
+                    }
+                }
+
+                return {
+                    type: 'comment',
+                    text: str,
+                };
+            }
+            case 0x0f8a7ea5: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const amount = s.loadCoins();
+                const destination = s.loadAddress();
+                const responseDestination = s.loadAddress();
+                const customPayload = s.loadMaybeRef();
+                const forwardAmount = s.loadCoins();
+
+                let forwardPayload: Cell | null = null;
+                if (s.loadBit()) {
+                    forwardPayload = s.loadRef();
+                } else {
+                    const p = s.asCell();
+                    s = new Cell().beginParse(); // clear the slice
+                    if (!p.hash().equals(new Cell().hash())) {
+                        if (params.disallowModification) {
+                            throw new Error('Jetton transfer message would be modified');
+                        }
+                        forwardPayload = p;
+                    }
+                }
+
+                s.endParse();
+
+                return {
+                    type: 'jetton-transfer',
+                    queryId,
+                    amount,
+                    destination,
+                    responseDestination,
+                    customPayload,
+                    forwardAmount,
+                    forwardPayload,
+                    knownJetton: null,
+                };
+            }
+            case 0x5fcc3d14: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const newOwner = s.loadAddress();
+                const responseDestination = s.loadAddress();
+                const customPayload = s.loadMaybeRef();
+                const forwardAmount = s.loadCoins();
+
+                let forwardPayload: Cell | null = null;
+                if (s.loadBit()) {
+                    forwardPayload = s.loadRef();
+                } else {
+                    const p = s.asCell();
+                    s = new Cell().beginParse(); // clear the slice
+                    if (!p.hash().equals(new Cell().hash())) {
+                        if (params.disallowModification) {
+                            throw new Error('Jetton transfer message would be modified');
+                        }
+                        forwardPayload = p;
+                    }
+                }
+
+                s.endParse();
+
+                return {
+                    type: 'nft-transfer',
+                    queryId,
+                    newOwner,
+                    responseDestination,
+                    customPayload,
+                    forwardAmount,
+                    forwardPayload,
+                };
+            }
+            case 0x595f07bc: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const amount = s.loadCoins();
+                const responseDestination = s.loadAddress();
+                let customPayload: Cell | Buffer | null = s.loadMaybeRef();
+                s.endParse();
+
+                if (params.encodeJettonBurnEthAddressAsHex && customPayload !== null && customPayload.bits.length === 160 && customPayload.refs.length === 0) {
+                    const cs = customPayload.beginParse();
+                    customPayload = cs.loadBuffer(20);
+                    cs.endParse();
+                }
+
+                return {
+                    type: 'jetton-burn',
+                    queryId,
+                    amount,
+                    responseDestination,
+                    customPayload,
+                };
+            }
+            case 0x7258a69b: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const address = s.loadAddress();
+                s.endParse();
+
+                return {
+                    type: 'add-whitelist',
+                    queryId,
+                    address,
+                };
+            }
+            case 0x1000: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const amount = s.loadCoins();
+                s.endParse();
+
+                return {
+                    type: 'single-nominator-withdraw',
+                    queryId,
+                    amount,
+                };
+            }
+            case 0x1001: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const address = s.loadAddress();
+                s.endParse();
+
+                return {
+                    type: 'single-nominator-change-validator',
+                    queryId,
+                    address,
+                };
+            }
+            case 0x47d54391: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                let appId: bigint | null = null;
+                if (s.remainingBits > 0) {
+                    appId = s.loadUintBig(64);
+                }
+                s.endParse();
+
+                return {
+                    type: 'tonstakers-deposit',
+                    queryId,
+                    appId,
+                };
+            }
+            case 0x69fb306c: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const votingAddress = s.loadAddress();
+                const expirationDate = s.loadUint(48);
+                const vote = s.loadBit();
+                const needConfirmation = s.loadBit();
+                s.endParse();
+
+                return {
+                    type: 'vote-for-proposal',
+                    queryId,
+                    votingAddress,
+                    expirationDate,
+                    vote,
+                    needConfirmation,
+                };
+            }
+            case 0x4eb1f0f9: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const key = s.loadBuffer(32);
+
+                if (key.equals(dnsWalletKey)) {
+                    if (s.remainingRefs > 0) {
+                        const vs = s.loadRef().beginParse();
+                        if (s.remainingBits > 0 && !params.disallowModification) {
+                            // tolerate the Maybe bit
+                            if (!s.loadBit()) throw new Error('Incorrect change DNS record message');
+                        }
+                        s.endParse();
+
+                        const type = vs.loadUint(16);
+                        if (type !== 0x9fd3) {
+                            throw new Error('Wrong DNS record type');
+                        }
+
+                        const address = vs.loadAddress();
+                        const flags = vs.loadUint(8);
+                        if (flags > 1) {
+                            throw new Error('DNS wallet record must have flags 0 or 1');
+                        }
+                        let capabilities: { isWallet: boolean } | null = (flags & 1) > 0 ? { isWallet: false } : null;
+                        if (capabilities !== null) {
+                            while (vs.loadBit()) {
+                                const cap = vs.loadUint(16);
+                                if (cap === 0x2177) {
+                                    if (capabilities.isWallet && params.disallowModification) {
+                                        throw new Error('DNS change record message would be modified');
+                                    }
+                                    capabilities.isWallet = true;
+                                } else {
+                                    throw new Error('Unknown DNS wallet record capability');
+                                }
+                            }
+                        }
+
+                        return {
+                            type: 'change-dns-record',
+                            queryId,
+                            record: {
+                                type: 'wallet',
+                                value: {
+                                    address,
+                                    capabilities,
+                                },
+                            },
+                        };
+                    } else {
+                        if (s.remainingBits > 0 && !params.disallowModification) {
+                            // tolerate the Maybe bit
+                            if (s.loadBit()) throw new Error('Incorrect change DNS record message');
+                        }
+                        s.endParse();
+
+                        return {
+                            type: 'change-dns-record',
+                            queryId,
+                            record: {
+                                type: 'wallet',
+                                value: null,
+                            },
+                        };
+                    }
+                } else {
+                    if (s.remainingRefs > 0) {
+                        const value = s.loadRef();
+                        if (s.remainingBits > 0 && !params.disallowModification) {
+                            // tolerate the Maybe bit
+                            if (!s.loadBit()) throw new Error('Incorrect change DNS record message');
+                        }
+                        s.endParse();
+
+                        return {
+                            type: 'change-dns-record',
+                            queryId,
+                            record: {
+                                type: 'unknown',
+                                key,
+                                value,
+                            },
+                        };
+                    } else {
+                        if (s.remainingBits > 0 && !params.disallowModification) {
+                            // tolerate the Maybe bit
+                            if (s.loadBit()) throw new Error('Incorrect change DNS record message');
+                        }
+                        s.endParse();
+
+                        return {
+                            type: 'change-dns-record',
+                            queryId,
+                            record: {
+                                type: 'unknown',
+                                key,
+                                value: null,
+                            },
+                        };
+                    }
+                }
+            }
+            case 0x8: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const swapId = s.loadBuffer(32);
+                s.endParse();
+
+                return {
+                    type: 'token-bridge-pay-swap',
+                    queryId,
+                    swapId,
+                };
+            }
+        }
+        throw new Error('Unknown op: ' + op);
+    } catch (e) {
+        if (params.disallowUnsafe) {
+            throw e;
+        }
+    }
+
+    return {
+        type: 'unsafe',
+        message: cell,
+    };
+}
 
 export type SignDataRequest =
     | { type: 'plaintext', text: string }
@@ -31,10 +402,13 @@ function chunks(buf: Buffer, n: number): Buffer[] {
     return cs;
 }
 
-function processAddressFlags(opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number }): { testOnly: boolean, bounceable: boolean, chain: number, flags: number } {
+function processAddressFlags(opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }): { testOnly: boolean, bounceable: boolean, chain: number, flags: number, specifiers?: { subwalletId: number, isV3R2: boolean } } {
     const bounceable = opts?.bounceable ?? true;
     const testOnly = opts?.testOnly ?? false;
     const chain = opts?.chain ?? 0;
+    const subwalletId = opts?.subwalletId ?? 698983191;
+    const walletVersion = opts?.walletVersion ?? 'v4';
+    let specifiers: { subwalletId: number, isV3R2: boolean } | undefined = undefined;
 
     let flags = 0x00;
     if (testOnly) {
@@ -43,8 +417,385 @@ function processAddressFlags(opts?: { testOnly?: boolean, bounceable?: boolean, 
     if (chain === -1) {
         flags |= 0x02;
     }
+    if (subwalletId !== 698983191 || walletVersion !== 'v4') {
+        flags |= 0x04;
+        specifiers = {
+            subwalletId,
+            isV3R2: walletVersion === 'v3r2',
+        };
+    }
 
-    return { bounceable, testOnly, chain, flags };
+    return { bounceable, testOnly, chain, flags, specifiers };
+}
+
+function convertPayload(input: TonPayloadFormat | undefined): { payload: Cell | null, hints: Buffer } {
+    let payload: Cell | null = null;
+    let hints: Buffer = Buffer.concat([writeUint8(0)]);
+
+    if (input === undefined) {
+        return {
+            payload,
+            hints,
+        };
+    }
+
+    switch (input.type) {
+        case 'unsafe': {
+            payload = input.message;
+            break;
+        }
+        case 'comment': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x00),
+                writeUint16(Buffer.from(input.text).length),
+                Buffer.from(input.text)
+            ]);
+            payload = beginCell()
+                .storeUint(0, 32)
+                .storeBuffer(Buffer.from(input.text))
+                .endCell();
+            break;
+        }
+        case 'jetton-transfer':
+        case 'nft-transfer': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(input.type === 'jetton-transfer' ? 0x01 : 0x02)
+            ]);
+
+            let b = beginCell()
+                .storeUint(input.type === 'jetton-transfer' ? 0x0f8a7ea5 : 0x5fcc3d14, 32);
+            let d = Buffer.alloc(0);
+
+            let flags = 0;
+            if (input.queryId !== null) {
+                flags |= 1;
+            }
+            if (input.type === 'jetton-transfer' && input.knownJetton !== null) {
+                flags |= 2;
+            }
+
+            d = Buffer.concat([d, writeUint8(flags)]);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                b = b.storeUint(0, 64);
+            }
+
+            if (input.type === 'jetton-transfer') {
+                if (input.knownJetton !== null) {
+                    d = Buffer.concat([d, writeUint16(input.knownJetton.jettonId), writeUint8(input.knownJetton.workchain)]);
+                }
+
+                d = Buffer.concat([d, writeVarUInt(input.amount)]);
+                b = b.storeCoins(input.amount);
+
+                d = Buffer.concat([d, writeAddress(input.destination)]);
+                b = b.storeAddress(input.destination);
+            } else {
+                d = Buffer.concat([d, writeAddress(input.newOwner)]);
+                b = b.storeAddress(input.newOwner);
+            }
+
+            d = Buffer.concat([d, writeAddress(input.responseDestination)]);
+            b = b.storeAddress(input.responseDestination);
+
+            if (input.customPayload !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeCellRef(input.customPayload)]);
+                b = b.storeMaybeRef(input.customPayload);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeMaybeRef(input.customPayload);
+            }
+
+            d = Buffer.concat([d, writeVarUInt(input.forwardAmount)]);
+            b = b.storeCoins(input.forwardAmount);
+
+            if (input.forwardPayload !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeCellRef(input.forwardPayload)]);
+                b = b.storeMaybeRef(input.forwardPayload);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeMaybeRef(input.forwardPayload);
+            }
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'jetton-burn': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x03)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x595f07bc, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            d = Buffer.concat([d, writeVarUInt(input.amount)]);
+            b = b.storeCoins(input.amount);
+
+            d = Buffer.concat([d, writeAddress(input.responseDestination)]);
+            b = b.storeAddress(input.responseDestination);
+
+            if (input.customPayload === null) {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeMaybeRef(input.customPayload);
+            } else if (input.customPayload instanceof Cell) {
+                d = Buffer.concat([d, writeUint8(1), writeCellRef(input.customPayload)]);
+                b = b.storeMaybeRef(input.customPayload);
+            } else {
+                d = Buffer.concat([d, writeUint8(2), writeCellInline(input.customPayload)]);
+                b = b.storeMaybeRef(beginCell().storeBuffer(input.customPayload).endCell());
+            }
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'add-whitelist':
+        case 'single-nominator-change-validator': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(input.type === 'add-whitelist' ? 0x04 : 0x06)
+            ]);
+
+            let b = beginCell()
+                .storeUint(input.type === 'add-whitelist' ? 0x7258a69b : 0x1001, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            d = Buffer.concat([d, writeAddress(input.address)]);
+            b = b.storeAddress(input.address);
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'single-nominator-withdraw': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x05)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x1000, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            d = Buffer.concat([d, writeVarUInt(input.amount)]);
+            b = b.storeCoins(input.amount);
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'tonstakers-deposit': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x07)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x47d54391, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            if (input.appId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.appId)]);
+                b = b.storeUint(input.appId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+            }
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'vote-for-proposal': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x08)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x69fb306c, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            d = Buffer.concat([d, writeAddress(input.votingAddress)]);
+            b = b.storeAddress(input.votingAddress);
+
+            d = Buffer.concat([d, writeUint48(input.expirationDate)]);
+            b = b.storeUint(input.expirationDate, 48);
+
+            d = Buffer.concat([d, writeUint8(input.vote ? 1 : 0), writeUint8(input.needConfirmation ? 1 : 0)]);
+            b = b.storeBit(input.vote).storeBit(input.needConfirmation);
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'change-dns-record': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x09)
+            ]);
+
+            let b = beginCell()
+                .storeUint(0x4eb1f0f9, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            if (input.record.type === 'unknown' && input.record.key.length !== 32) {
+                throw new Error('DNS record key length must be 32 bytes long');
+            }
+            b = b.storeBuffer(input.record.type === 'wallet' ? sha256_sync('wallet') : input.record.key);
+
+            d = Buffer.concat([d, writeUint8(input.record.value === null ? 0 : 1), writeUint8(input.record.type === 'wallet' ? 0 : 1)]);
+
+            if (input.record.type === 'wallet') {
+                if (input.record.value !== null) {
+                    d = Buffer.concat([d, writeAddress(input.record.value.address), writeUint8(input.record.value.capabilities === null ? 0 : 1)]);
+                    let rb = beginCell().storeUint(0x9fd3, 16).storeAddress(input.record.value.address).storeUint(input.record.value.capabilities === null ? 0 : 1, 8);
+                    if (input.record.value.capabilities !== null) {
+                        d = Buffer.concat([d, writeUint8(input.record.value.capabilities.isWallet ? 1 : 0)]);
+                        if (input.record.value.capabilities.isWallet) {
+                            rb = rb.storeBit(true).storeUint(0x2177, 16);
+                        }
+                        rb = rb.storeBit(false);
+                    }
+                    b = b.storeRef(rb);
+                }
+            } else {
+                d = Buffer.concat([d, input.record.key]);
+                if (input.record.value !== null) {
+                    d = Buffer.concat([d, writeCellRef(input.record.value)]);
+                    b = b.storeRef(input.record.value);
+                }
+            }
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        case 'token-bridge-pay-swap': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x0A)
+            ]);
+
+            let b = beginCell()
+                .storeUint(8, 32);
+            let d = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                d = Buffer.concat([d, writeUint8(1), writeUint64(input.queryId)]);
+                b = b.storeUint(input.queryId, 64);
+            } else {
+                d = Buffer.concat([d, writeUint8(0)]);
+                b = b.storeUint(0, 64);
+            }
+
+            if (input.swapId.length !== 32) {
+                throw new Error('Token bridge swap ID must be 32 bytes long');
+            }
+
+            d = Buffer.concat([d, input.swapId]);
+            b = b.storeBuffer(input.swapId);
+
+            payload = b.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(d.length),
+                d
+            ]);
+            break;
+        }
+        default: {
+            throw new Error('Unknown payload type: ' + (input as any).type);
+        }
+    }
+
+    return {
+        payload,
+        hints,
+    };
 }
 
 export class TonTransport {
@@ -95,13 +846,13 @@ export class TonTransport {
     // Operations
     //
 
-    async getAddress(path: number[], opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number }) {
+    async getAddress(path: number[], opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }) {
 
         // Check path
         validatePath(path);
 
         // Resolve flags
-        const { bounceable, testOnly, chain } = processAddressFlags(opts);
+        const { bounceable, testOnly, chain, specifiers } = processAddressFlags(opts);
 
         // Get public key
         let response = await this.#doRequest(INS_ADDRESS, 0x00, 0x00, pathElementsToBuffer(path.map((v) => v + 0x80000000)));
@@ -110,34 +861,39 @@ export class TonTransport {
         }
 
         // Contract
-        const contract = getInit(chain, response);
+        const contract = getInit(response, specifiers?.subwalletId ?? 698983191, specifiers?.isV3R2 ?? false);
         const address = contractAddress(chain, contract);
 
         return { address: address.toString({ bounceable, testOnly }), publicKey: response };
     }
 
-    async validateAddress(path: number[], opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number }) {
+    async validateAddress(path: number[], opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }) {
 
         // Check path
         validatePath(path);
 
         // Resolve flags
-        const { bounceable, testOnly, chain, flags } = processAddressFlags(opts);
+        const { bounceable, testOnly, chain, flags, specifiers } = processAddressFlags(opts);
+
+        let r = pathElementsToBuffer(path.map((v) => v + 0x80000000));
+        if (specifiers !== undefined) {
+            r = Buffer.concat([r, writeUint8(specifiers.isV3R2 ? 1 : 0), writeUint32(specifiers.subwalletId)]);
+        }
 
         // Get public key
-        let response = await this.#doRequest(INS_ADDRESS, 0x01, flags, pathElementsToBuffer(path.map((v) => v + 0x80000000)));
+        let response = await this.#doRequest(INS_ADDRESS, 0x01, flags, r);
         if (response.length !== 32) {
             throw Error('Invalid response');
         }
 
         // Contract
-        const contract = getInit(chain, response);
+        const contract = getInit(response, specifiers?.subwalletId ?? 698983191, specifiers?.isV3R2 ?? false);
         const address = contractAddress(chain, contract);
 
         return { address: address.toString({ bounceable, testOnly }), publicKey: response };
     }
 
-    async getAddressProof(path: number[], params: { domain: string, timestamp: number, payload: Buffer }, opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number }) {
+    async getAddressProof(path: number[], params: { domain: string, timestamp: number, payload: Buffer }, opts?: { testOnly?: boolean, bounceable?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }) {
 
         // Check path
         validatePath(path);
@@ -145,11 +901,17 @@ export class TonTransport {
         let publicKey = (await this.getAddress(path)).publicKey;
 
         // Resolve flags
-        const { flags } = processAddressFlags(opts);
+        const { flags, specifiers } = processAddressFlags(opts);
+
+        let specifiersBuf = Buffer.alloc(0);
+        if (specifiers !== undefined) {
+            specifiersBuf = Buffer.concat([writeUint8(specifiers.isV3R2 ? 1 : 0), writeUint32(specifiers.subwalletId)]);
+        }
 
         const domainBuf = Buffer.from(params.domain, 'utf-8');
         const reqBuf = Buffer.concat([
             pathElementsToBuffer(path.map((v) => v + 0x80000000)),
+            specifiersBuf,
             writeUint8(domainBuf.length),
             domainBuf,
             writeUint64(BigInt(params.timestamp)),
@@ -280,7 +1042,11 @@ export class TonTransport {
             bounce: boolean,
             amount: bigint,
             stateInit?: StateInit,
-            payload?: TonPayloadFormat
+            payload?: TonPayloadFormat,
+            walletSpecifiers?: {
+                subwalletId?: number,
+                includeWalletOp: boolean,
+            },
         }
     ) => {
 
@@ -298,7 +1064,19 @@ export class TonTransport {
         //
 
         let pkg = Buffer.concat([
-            writeUint8(0), // Header
+            writeUint8(transaction.walletSpecifiers === undefined ? 0 : 1), // tag
+        ]);
+
+        if (transaction.walletSpecifiers !== undefined) {
+            pkg = Buffer.concat([
+                pkg,
+                writeUint32(transaction.walletSpecifiers.subwalletId ?? DEFAULT_SUBWALLET_ID),
+                writeUint8(transaction.walletSpecifiers.includeWalletOp ? 1 : 0),
+            ]);
+        }
+
+        pkg = Buffer.concat([
+            pkg,
             writeUint32(transaction.seqno),
             writeUint32(transaction.timeout),
             writeVarUInt(transaction.amount),
@@ -333,83 +1111,7 @@ export class TonTransport {
         // Payload
         //
 
-        let payload: Cell | null = null;
-        let hints: Buffer = Buffer.concat([writeUint8(0)]);
-        if (transaction.payload) {
-            if (transaction.payload.type === 'comment') {
-                hints = Buffer.concat([
-                    writeUint8(1),
-                    writeUint32(0x00),
-                    writeUint16(Buffer.from(transaction.payload.text).length),
-                    Buffer.from(transaction.payload.text)
-                ]);
-                payload = beginCell()
-                    .storeUint(0, 32)
-                    .storeBuffer(Buffer.from(transaction.payload.text))
-                    .endCell()
-            } else if (transaction.payload.type === 'jetton-transfer' || transaction.payload.type === 'nft-transfer') {
-                hints = Buffer.concat([
-                    writeUint8(1),
-                    writeUint32(transaction.payload.type === 'jetton-transfer' ? 0x01 : 0x02)
-                ]);
-
-                let b = beginCell()
-                    .storeUint(transaction.payload.type === 'jetton-transfer' ? 0x0f8a7ea5 : 0x5fcc3d14, 32);
-                let d = Buffer.alloc(0);
-
-                if (transaction.payload.queryId !== null) {
-                    d = Buffer.concat([d, writeUint8(1), writeUint64(transaction.payload.queryId)]);
-                    b = b.storeUint(transaction.payload.queryId, 64);
-                } else {
-                    d = Buffer.concat([d, writeUint8(0)]);
-                    b = b.storeUint(0, 64);
-                }
-
-                if (transaction.payload.type === 'jetton-transfer') {
-                    d = Buffer.concat([d, writeVarUInt(transaction.payload.amount)]);
-                    b = b.storeCoins(transaction.payload.amount);
-
-                    d = Buffer.concat([d, writeAddress(transaction.payload.destination)]);
-                    b = b.storeAddress(transaction.payload.destination);
-                } else {
-                    d = Buffer.concat([d, writeAddress(transaction.payload.newOwner)]);
-                    b = b.storeAddress(transaction.payload.newOwner);
-                }
-
-                d = Buffer.concat([d, writeAddress(transaction.payload.responseDestination)]);
-                b = b.storeAddress(transaction.payload.responseDestination);
-
-                if (transaction.payload.customPayload !== null) {
-                    d = Buffer.concat([d, writeUint8(1), writeCellRef(transaction.payload.customPayload)]);
-                    b = b.storeMaybeRef(transaction.payload.customPayload);
-                } else {
-                    d = Buffer.concat([d, writeUint8(0)]);
-                    b = b.storeMaybeRef(transaction.payload.customPayload);
-                }
-
-                d = Buffer.concat([d, writeVarUInt(transaction.payload.forwardAmount)]);
-                b = b.storeCoins(transaction.payload.forwardAmount);
-
-                if (transaction.payload.forwardPayload !== null) {
-                    d = Buffer.concat([d, writeUint8(1), writeCellRef(transaction.payload.forwardPayload)]);
-                    b = b.storeMaybeRef(transaction.payload.forwardPayload);
-                } else {
-                    d = Buffer.concat([d, writeUint8(0)]);
-                    b = b.storeMaybeRef(transaction.payload.forwardPayload);
-                }
-
-                payload = b.endCell();
-                hints = Buffer.concat([
-                    hints,
-                    writeUint16(d.length),
-                    d
-                ])
-            }
-        }
-
-        //
-        // Serialize payload
-        //
+        const { payload, hints } = convertPayload(transaction.payload);
 
         if (payload) {
             pkg = Buffer.concat([
@@ -478,12 +1180,16 @@ export class TonTransport {
         }
 
         // Transfer message
-        let transfer = beginCell()
-            .storeUint(698983191, 32)
+        let transferB = beginCell()
+            .storeUint(transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID, 32)
             .storeUint(transaction.timeout, 32)
-            .storeUint(transaction.seqno, 32)
-            .storeUint(0, 8)
-            .storeUint(transaction.sendMode, 8)
+            .storeUint(transaction.seqno, 32);
+
+        if (transaction.walletSpecifiers?.includeWalletOp ?? true) {
+            transferB = transferB.storeUint(0, 8)
+        }
+
+        let transfer = transferB.storeUint(transaction.sendMode, 8)
             .storeRef(orderBuilder.endCell())
             .endCell();
 
@@ -502,6 +1208,17 @@ export class TonTransport {
             .storeBuffer(signature)
             .storeSlice(transfer.beginParse())
             .endCell();
+    }
+
+    async getSettings(): Promise<{
+        blindSigningEnabled: boolean
+        expertMode: boolean
+    }> {
+        let loaded = await this.#doRequest(INS_SETTINGS, 0x00, 0x00, Buffer.alloc(0));
+        return {
+            blindSigningEnabled: (loaded[0] & 0x01) > 0,
+            expertMode: (loaded[0] & 0x02) > 0,
+        };
     }
 
     #doRequest = async (ins: number, p1: number, p2: number, data: Buffer) => {
