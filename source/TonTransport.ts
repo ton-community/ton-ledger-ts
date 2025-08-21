@@ -1,5 +1,5 @@
 import Transport from "@ledgerhq/hw-transport";
-import { Address, beginCell, Cell, contractAddress, SendMode, StateInit, storeStateInit } from "@ton/core";
+import { Address, beginCell, Cell, contractAddress, internal, loadMessage, loadMessageRelaxed, Message, SendMode, StateInit, storeMessageRelaxed, storeStateInit } from "@ton/core";
 import { sha256_sync, signVerify } from '@ton/crypto';
 import { AsyncLock } from 'teslabot';
 import { writeAddress, writeCellInline, writeCellRef, writeUint16, writeUint32, writeUint48, writeUint64, writeUint8, writeVarUInt } from "./utils/ledgerWriter";
@@ -50,6 +50,32 @@ export const KNOWN_JETTONS: KnownJetton[] = [
         symbol: 'STAKED',
         masterAddress: Address.parse('EQCqC6EhRJ_tpWngKxL6dV0k6DSnRUrs9GSVkLbfdCqsj6TE'),
     },
+    {
+        symbol: 'CATI',
+        masterAddress: Address.parse('EQD-cvR0Nz6XAyRBvbhz-abTrRC6sI5tvHvvpeQraV9UAAD7'),
+    },
+    {
+        symbol: 'DOGS',
+        masterAddress: Address.parse('EQCvxJy4eG8hyHBFsZ7eePxrRsUQSFE_jpptRAYBmcG_DOGS'),
+    },
+    {
+        symbol: 'X',
+        masterAddress: Address.parse('EQB4zZusHsbU2vVTPqjhlokIOoiZhEdCMT703CWEzhTOo__X'),
+    },
+];
+
+export type ExtraCurrency = {
+    id: number;
+    symbol: string;
+    decimals: number;
+};
+
+export const KNOWN_EXTRA_CURRENCIES: ExtraCurrency[] = [
+    {
+        id: 1,
+        symbol: 'tgBTC',
+        decimals: 8,
+    },
 ];
 
 export type TonPayloadFormat =
@@ -65,6 +91,9 @@ export type TonPayloadFormat =
     | { type: 'vote-for-proposal', queryId: bigint | null, votingAddress: Address, expirationDate: number, vote: boolean, needConfirmation: boolean }
     | { type: 'change-dns-record', queryId: bigint | null, record: { type: 'wallet', value: { address: Address, capabilities: { isWallet: boolean } | null } | null } | { type: 'unknown', key: Buffer, value: Cell | null } }
     | { type: 'token-bridge-pay-swap', queryId: bigint | null, swapId: Buffer }
+    | { type: 'tonwhales-pool-deposit', queryId: bigint, gasLimit: bigint }
+    | { type: 'tonwhales-pool-withdraw', queryId: bigint, gasLimit: bigint, amount: bigint }
+    | { type: 'vesting-send-msg-comment', queryId: bigint | null, sendMode: number, value: bigint, destination: Address, text: string }
 
 const dnsWalletKey = Buffer.from([0xe8, 0xd4, 0x40, 0x50, 0x87, 0x3d, 0xba, 0x86, 0x5a, 0xa7, 0xc1, 0x70, 0xab, 0x4c, 0xce, 0x64,
                                   0xd9, 0x08, 0x39, 0xa3, 0x4d, 0xcf, 0xd6, 0xcf, 0x71, 0xd1, 0x4e, 0x02, 0x05, 0x44, 0x3b, 0x1b]);
@@ -373,6 +402,65 @@ export function parseMessage(cell: Cell, opts?: { disallowUnsafe?: boolean, disa
                     type: 'token-bridge-pay-swap',
                     queryId,
                     swapId,
+                };
+            }
+            case 0x7bcd1fef: {
+                const queryId = s.loadUintBig(64);
+                if (queryId <= 0n) {
+                    throw new Error('Incorrect query id: must be greater than 0');
+                }
+                const gasLimit = s.loadCoins();
+                s.endParse();
+                return {
+                    type: 'tonwhales-pool-deposit',
+                    queryId,
+                    gasLimit,
+                };
+            }
+            case 0xda803efd: {
+                const queryId = s.loadUintBig(64);
+                if (queryId <= 0n) {
+                    throw new Error('Incorrect query id: must be greater than 0');
+                }
+                const gasLimit = s.loadCoins();
+                const amount = s.loadCoins();
+                s.endParse();
+                return {
+                    type: 'tonwhales-pool-withdraw',
+                    queryId,
+                    gasLimit,
+                    amount,
+                };
+            }
+            case 0xa7733acd: {
+                const queryId = normalizeQueryId(s.loadUintBig(64));
+                const sendMode = s.loadUint(8);
+                const msgRefSlice = s.loadRef().beginParse();
+                s.endParse();
+                
+                const msg = loadMessageRelaxed(msgRefSlice);
+                if (msg.info.type !== 'internal') {
+                    throw new Error('Message is not internal');
+                }
+
+                const body = msg.body.beginParse();
+                const op = body.loadUint(32);
+                if (op !== 0) {
+                    throw new Error('Message body is not a comment');
+                }
+                const text = body.loadStringTail();
+                if (text.length > 120) {
+                    throw new Error('Comment must be at most 120 ASCII characters long');
+                }
+                body.endParse();
+
+                return {
+                    type: 'vesting-send-msg-comment',
+                    queryId,
+                    sendMode,
+                    value: msg.info.value.coins,
+                    destination: msg.info.dest,
+                    text,
                 };
             }
         }
@@ -787,6 +875,104 @@ function convertPayload(input: TonPayloadFormat | undefined): { payload: Cell | 
             ]);
             break;
         }
+        case 'tonwhales-pool-deposit': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x0B)
+            ]);
+
+            const cell = beginCell()
+                .storeUint(0x7bcd1fef, 32)
+                .storeUint(input.queryId, 64)
+                .storeCoins(input.gasLimit)
+                .endCell();
+            const buffer = Buffer.concat([
+                writeUint64(input.queryId),
+                writeVarUInt(input.gasLimit)    
+            ]);
+
+            payload = cell;
+            hints = Buffer.concat([
+                hints,
+                writeUint16(buffer.length),
+                buffer
+            ]);
+
+            break;
+        }
+        case 'tonwhales-pool-withdraw': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x0C)
+            ]);
+            
+            const cell = beginCell()
+                .storeUint(0xda803efd, 32)
+                .storeUint(input.queryId, 64)
+                .storeCoins(input.gasLimit)
+                .storeCoins(input.amount)
+                .endCell();
+            const buffer = Buffer.concat([
+                writeUint64(input.queryId),
+                writeVarUInt(input.gasLimit),
+                writeVarUInt(input.amount)
+            ]); 
+
+            payload = cell;
+            hints = Buffer.concat([
+                hints,
+                writeUint16(buffer.length),
+                buffer
+            ]);
+            break;
+        }
+        case 'vesting-send-msg-comment': {
+            hints = Buffer.concat([
+                writeUint8(1),
+                writeUint32(0x0D)
+            ]);
+            
+            let builder = beginCell()
+                .storeUint(0xa7733acd, 32)
+            let buffer = Buffer.alloc(0);
+
+            if (input.queryId !== null) {
+                builder = builder.storeUint(input.queryId, 64)
+                buffer = Buffer.concat([buffer, writeUint8(1), writeUint64(input.queryId)]);
+            }else{
+                builder = builder.storeUint(0, 64)
+                buffer = Buffer.concat([buffer, writeUint8(0)]);
+            }
+
+            builder = builder.storeUint(input.sendMode, 8);
+            buffer = Buffer.concat([buffer, writeUint8(input.sendMode)]);
+
+            const msg = internal({
+                to: input.destination,
+                value: input.value,
+                body: beginCell().storeUint(0, 32).storeStringTail(input.text).endCell(),
+            })
+
+            const msgRefBuilder = beginCell();
+            storeMessageRelaxed(msg)(msgRefBuilder);
+
+            builder = builder.storeRef(msgRefBuilder.endCell());
+
+            buffer = Buffer.concat([buffer, writeAddress(input.destination)]);
+            buffer = Buffer.concat([buffer, writeVarUInt(input.value)]);
+            if (input.text.length > 120) {
+                throw new Error('Comment must be at most 120 ASCII characters long');
+            }
+            buffer = Buffer.concat([buffer, writeUint8(Buffer.from(input.text).length), Buffer.from(input.text)]);
+
+            payload = builder.endCell();
+            hints = Buffer.concat([
+                hints,
+                writeUint16(buffer.length),
+                buffer
+            ]);
+            break;
+        }
         default: {
             throw new Error('Unknown payload type: ' + (input as any).type);
         }
@@ -1047,11 +1233,19 @@ export class TonTransport {
                 subwalletId?: number,
                 includeWalletOp: boolean,
             },
+            extraCurrency?: {
+                index: number,
+                amount: bigint,
+            },
         }
     ) => {
 
         // Check path
         validatePath(path);
+
+        if (transaction.extraCurrency !== undefined && transaction.extraCurrency.index >= KNOWN_EXTRA_CURRENCIES.length) {
+            throw Error('Invalid extra currency index');
+        }
 
         //
         // Fetch key
@@ -1063,15 +1257,36 @@ export class TonTransport {
         // Create package
         //
 
+        const includeWalletOp = transaction.walletSpecifiers?.includeWalletOp ?? true;
+        const subwalletId = transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID;
+
+        const useTag1 = transaction.walletSpecifiers !== undefined || transaction.extraCurrency !== undefined;
+
         let pkg = Buffer.concat([
-            writeUint8(transaction.walletSpecifiers === undefined ? 0 : 1), // tag
+            writeUint8(useTag1 ? 1 : 0), // tag
         ]);
 
-        if (transaction.walletSpecifiers !== undefined) {
+        if (useTag1) {
+            let flags = 0;
+            if (includeWalletOp) {
+                flags |= 1;
+            }
+            if (transaction.extraCurrency !== undefined) {
+                flags |= 2;
+            }
+
             pkg = Buffer.concat([
                 pkg,
-                writeUint32(transaction.walletSpecifiers.subwalletId ?? DEFAULT_SUBWALLET_ID),
-                writeUint8(transaction.walletSpecifiers.includeWalletOp ? 1 : 0),
+                writeUint32(subwalletId),
+                writeUint8(flags),
+            ]);
+        }
+
+        let ecBuf = Buffer.alloc(0);
+        if (transaction.extraCurrency !== undefined) {
+            ecBuf = Buffer.concat([
+                writeUint8(transaction.extraCurrency.index),
+                writeVarUInt(transaction.extraCurrency.amount),
             ]);
         }
 
@@ -1080,6 +1295,7 @@ export class TonTransport {
             writeUint32(transaction.seqno),
             writeUint32(transaction.timeout),
             writeVarUInt(transaction.amount),
+            ecBuf,
             writeAddress(transaction.to),
             writeUint8(transaction.bounce ? 1 : 0),
             writeUint8(transaction.sendMode),
@@ -1152,7 +1368,20 @@ export class TonTransport {
             .storeAddress(null)
             .storeAddress(transaction.to)
             .storeCoins(transaction.amount)
-            .storeBit(false)
+
+        if (transaction.extraCurrency !== undefined) {
+            orderBuilder = orderBuilder
+                .storeBit(true)
+                .storeRef(beginCell()
+                    .storeUint(0b10, 2)
+                    .storeUint(32, 6)
+                    .storeUint(KNOWN_EXTRA_CURRENCIES[transaction.extraCurrency.index].id, 32)
+                    .storeVarUint(transaction.extraCurrency.amount, 5))
+        } else {
+            orderBuilder = orderBuilder.storeBit(false)
+        }
+
+        orderBuilder = orderBuilder
             .storeCoins(0)
             .storeCoins(0)
             .storeUint(0, 64)
@@ -1181,11 +1410,11 @@ export class TonTransport {
 
         // Transfer message
         let transferB = beginCell()
-            .storeUint(transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID, 32)
+            .storeUint(subwalletId, 32)
             .storeUint(transaction.timeout, 32)
             .storeUint(transaction.seqno, 32);
 
-        if (transaction.walletSpecifiers?.includeWalletOp ?? true) {
+        if (includeWalletOp) {
             transferB = transferB.storeUint(0, 8)
         }
 
