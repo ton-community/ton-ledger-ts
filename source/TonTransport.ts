@@ -62,6 +62,10 @@ export const KNOWN_JETTONS: KnownJetton[] = [
         symbol: 'X',
         masterAddress: Address.parse('EQB4zZusHsbU2vVTPqjhlokIOoiZhEdCMT703CWEzhTOo__X'),
     },
+    {
+        symbol: 'tgBTC',
+        masterAddress: Address.parse('EQBmjxpYsJ8yHEraYfTpLdejCekHMoKS2fOErP4lLHCf4SlU'),
+    },
 ];
 
 export type ExtraCurrency = {
