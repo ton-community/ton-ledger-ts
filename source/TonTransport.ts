@@ -1454,6 +1454,10 @@ export class TonTransport {
         };
     }
 
+    async launchApp() {
+        await this.#doRequest(0xd8, 0x00, 0x00, Buffer.from('TON', 'ascii'));
+    }
+
     #doRequest = async (ins: number, p1: number, p2: number, data: Buffer) => {
         return this.#lock.inLock(async () => {
             let r = await this.transport.send(
