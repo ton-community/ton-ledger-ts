@@ -2,7 +2,7 @@ import Transport from "@ledgerhq/hw-transport";
 import { Address, beginCell, Cell, contractAddress, internal, loadMessage, loadMessageRelaxed, Message, SendMode, StateInit, storeMessageRelaxed, storeStateInit } from "@ton/core";
 import { sha256_sync, signVerify } from '@ton/crypto';
 import { AsyncLock } from 'teslabot';
-import { writeAddress, writeCellInline, writeCellRef, writeUint16, writeUint32, writeUint48, writeUint64, writeUint8, writeVarUInt } from "./utils/ledgerWriter";
+import { writeAddress, writeCellInline, writeCellRef, writeInt32BE, writeUint16, writeUint32, writeUint48, writeUint64, writeUint8, writeVarUInt } from "./utils/ledgerWriter";
 import { getInit } from "./utils/getInit";
 
 const LEDGER_SYSTEM = 0xB0;
@@ -484,6 +484,17 @@ export function parseMessage(cell: Cell, opts?: { disallowUnsafe?: boolean, disa
 export type SignDataRequest =
     | { type: 'plaintext', text: string }
     | { type: 'app-data', address?: Address, domain?: string, data: Cell, ext?: Cell }
+
+export type SignDataNewRequestCommon = {
+    domain: string;
+}
+
+export type SignDataNewRequestPartial =
+    | { type: 'plaintext', text: string }
+    | { type: 'binary', data: Buffer }
+    | { type: 'app-data', schemaCrc: number, data: Cell }
+
+export type SignDataNewRequest = SignDataNewRequestCommon & SignDataNewRequestPartial
 
 function chunks(buf: Buffer, n: number): Buffer[] {
     const nc = Math.ceil(buf.length / n);
@@ -1218,6 +1229,128 @@ export class TonTransport {
         return {
             signature,
             cell,
+            timestamp,
+        }
+    }
+
+    async signDataNew(path: number[], req: SignDataNewRequest, opts?: { timestamp?: number, testOnly?: boolean, chain?: number, subwalletId?: number, walletVersion?: 'v3r2' | 'v4' }) {
+        validatePath(path);
+
+        const { publicKey, address: addressString } = (await this.getAddress(path, opts));
+        const expectedAddress = Address.parse(addressString);
+
+        const { flags, specifiers, chain } = processAddressFlags(opts);
+
+        let specifiersBuf = Buffer.alloc(0);
+        if (specifiers !== undefined) {
+            specifiersBuf = Buffer.concat([writeUint8(specifiers.isV3R2 ? 1 : 0), writeUint32(specifiers.subwalletId)]);
+        }
+
+        const timestamp = opts?.timestamp ?? Math.floor(Date.now() / 1000)
+
+        const domainBuf = Buffer.from(req.domain, 'ascii');
+
+        let typeId: number
+        let payload: Buffer
+        let signedData: Cell | Buffer
+        switch (req.type) {
+            case 'plaintext': {
+                typeId = 0;
+                payload = Buffer.from(req.text, 'ascii');
+                signedData = Buffer.concat([
+                    Buffer.from([0xff, 0xff]),
+                    Buffer.from('ton-connect/sign-data/'),
+                    writeInt32BE(chain),
+                    expectedAddress.hash,
+                    writeUint32(domainBuf.length),
+                    domainBuf,
+                    writeUint64(BigInt(timestamp)),
+                    Buffer.from('txt', 'ascii'),
+                    writeUint32(payload.length),
+                    payload,
+                ]);
+                break;
+            }
+            case 'binary': {
+                typeId = 1;
+                payload = req.data;
+                signedData = Buffer.concat([
+                    Buffer.from([0xff, 0xff]),
+                    Buffer.from('ton-connect/sign-data/'),
+                    writeInt32BE(chain),
+                    expectedAddress.hash,
+                    writeUint32(domainBuf.length),
+                    domainBuf,
+                    writeUint64(BigInt(timestamp)),
+                    Buffer.from('bin', 'ascii'),
+                    writeUint32(payload.length),
+                    payload,
+                ]);
+                break;
+            }
+            case 'app-data': {
+                typeId = 2;
+                payload = Buffer.concat([
+                    writeUint32(req.schemaCrc),
+                    writeCellRef(req.data),
+                ]);
+
+                let inner = beginCell();
+                req.domain.split('.').reverse().forEach(p => {
+                    inner.storeBuffer(Buffer.from(p, 'ascii'));
+                    inner.storeUint(0, 8);
+                });
+
+                signedData = beginCell()
+                    .storeUint(0x75569022, 32) // prefix
+                    .storeUint(req.schemaCrc, 32) // schema hash
+                    .storeUint(timestamp, 64) // timestamp
+                    .storeAddress(expectedAddress) // user wallet address
+                    .storeRef(inner) // domain
+                    .storeRef(req.data) // payload cell
+                    .endCell();
+
+                break;
+            }
+            default: {
+                throw new Error(`Sign data request type '${(req as any).type}' not supported`)
+            }
+        }
+
+        const pkg = Buffer.concat([
+            writeUint8(typeId),
+            writeUint8(flags),
+            specifiersBuf,
+            writeUint8(domainBuf.length),
+            domainBuf,
+            writeUint64(BigInt(timestamp)),
+            payload,
+        ]);
+
+        await this.#doRequest(INS_SIGN_DATA, 0x01, 0x03, pathElementsToBuffer(path.map((v) => v + 0x80000000)));
+        const pkgCs = chunks(pkg, 255);
+        for (let i = 0; i < pkgCs.length - 1; i++) {
+            await this.#doRequest(INS_SIGN_DATA, 0x01, 0x02, pkgCs[i]);
+        }
+        const res = await this.#doRequest(INS_SIGN_DATA, 0x01, 0x00, pkgCs[pkgCs.length-1]);
+
+        let signature = res.subarray(1, 1 + 64);
+        let hash = res.subarray(2 + 64, 2 + 64 + 32);
+
+        const signedDataHash = signedData instanceof Cell ? signedData.hash() : sha256_sync(signedData);
+
+        if (!hash.equals(signedDataHash)) {
+            throw Error('Hash mismatch. Expected: ' + signedDataHash.toString('hex') + ', got: ' + hash.toString('hex'));
+        }
+        if (!signVerify(signedDataHash, signature, publicKey)) {
+            throw Error('Received signature is invalid');
+        }
+
+        return {
+            signature,
+            address: expectedAddress,
+            signedData,
+            signedDataHash,
             timestamp,
         }
     }

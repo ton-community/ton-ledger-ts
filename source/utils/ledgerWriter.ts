@@ -1,5 +1,11 @@
 import { Address, Cell, beginCell } from '@ton/core';
 
+export function writeInt32BE(value: number) {
+    let b = Buffer.alloc(4);
+    b.writeInt32BE(value, 0);
+    return b;
+}
+
 export function writeUint32(value: number) {
     let b = Buffer.alloc(4);
     b.writeUint32BE(value, 0);
