@@ -999,6 +999,15 @@ function convertPayload(input: TonPayloadFormat | undefined): { payload: Cell | 
     };
 }
 
+export type LedgerMessage = {
+    to: Address,
+    sendMode: SendMode,
+    bounce: boolean,
+    amount: bigint,
+    stateInit?: StateInit,
+    payload?: TonPayloadFormat,
+};
+
 export class TonTransport {
     readonly transport: Transport;
     #lock = new AsyncLock();
@@ -1355,6 +1364,214 @@ export class TonTransport {
         }
     }
 
+    signMultiTransaction = async (
+        path: number[],
+        transaction: {
+            seqno: number,
+            timeout: number,
+            walletSpecifiers?: {
+                subwalletId?: number,
+                includeWalletOp: boolean,
+                expectedPublicKey?: Buffer,
+            },
+        },
+        messages: LedgerMessage[],
+    ) => {
+        // Check path
+        validatePath(path);
+
+        //
+        // Fetch key
+        //
+
+        let publicKey = (await this.getAddress(path)).publicKey;
+
+        if (transaction.walletSpecifiers?.expectedPublicKey !== undefined && !transaction.walletSpecifiers.expectedPublicKey.equals(publicKey)) {
+            throw Error('Expected public key mismatch');
+        }
+
+        //
+        // Create package
+        //
+
+        const includeWalletOp = transaction.walletSpecifiers?.includeWalletOp ?? true;
+        const subwalletId = transaction.walletSpecifiers?.subwalletId ?? DEFAULT_SUBWALLET_ID;
+
+        const useTag1 = transaction.walletSpecifiers !== undefined;
+
+        let pkg = Buffer.concat([
+            writeUint8(messages.length),
+            writeUint8(useTag1 ? 1 : 0), // tag
+        ]);
+
+        if (useTag1) {
+            let flags = 0;
+            if (includeWalletOp) {
+                flags |= 1;
+            }
+            if (transaction.walletSpecifiers?.expectedPublicKey !== undefined) {
+                flags |= 4;
+            }
+
+            pkg = Buffer.concat([
+                pkg,
+                writeUint32(subwalletId),
+                writeUint8(flags),
+                transaction.walletSpecifiers?.expectedPublicKey ?? Buffer.alloc(0),
+            ]);
+        }
+
+        pkg = Buffer.concat([
+            pkg,
+            writeUint32(transaction.seqno),
+            writeUint32(transaction.timeout),
+        ]);
+
+        let messagePkgs: Buffer[] = [];
+        let messageCells: Cell[] = [];
+
+        for (const message of messages) {
+            let pkg = Buffer.concat([
+                writeVarUInt(message.amount),
+                writeAddress(message.to),
+                writeUint8(message.bounce ? 1 : 0),
+                writeUint8(message.sendMode),
+            ]);
+
+            let stateInit: Cell | null = null;
+            if (message.stateInit) {
+                stateInit = beginCell()
+                    .store(storeStateInit(message.stateInit))
+                    .endCell();
+                pkg = Buffer.concat([
+                    pkg,
+                    writeUint8(1),
+                    writeUint16(stateInit.depth()),
+                    stateInit.hash()
+                ])
+            } else {
+                pkg = Buffer.concat([
+                    pkg,
+                    writeUint8(0)
+                ]);
+            }
+
+            const { payload, hints } = convertPayload(message.payload);
+
+            if (payload) {
+                pkg = Buffer.concat([
+                    pkg,
+                    writeUint8(1),
+                    writeUint16(payload.depth()),
+                    payload.hash(),
+                    hints
+                ])
+            } else {
+                pkg = Buffer.concat([
+                    pkg,
+                    writeUint8(0),
+                    writeUint8(0)
+                ]);
+            }
+
+            let orderBuilder = beginCell()
+                .storeBit(0)
+                .storeBit(true)
+                .storeBit(message.bounce)
+                .storeBit(false)
+                .storeAddress(null)
+                .storeAddress(message.to)
+                .storeCoins(message.amount)
+                .storeBit(false)
+                .storeCoins(0)
+                .storeCoins(0)
+                .storeUint(0, 64)
+                .storeUint(0, 32)
+
+            if (stateInit) {
+                orderBuilder = orderBuilder
+                    .storeBit(true)
+                    .storeBit(true) // Always in reference
+                    .storeRef(stateInit)
+            } else {
+                orderBuilder = orderBuilder
+                    .storeBit(false);
+            }
+
+            if (payload) {
+                orderBuilder = orderBuilder
+                    .storeBit(true) // Always in reference
+                    .storeRef(payload)
+            } else {
+                orderBuilder = orderBuilder
+                    .storeBit(false)
+            }
+
+            messagePkgs.push(pkg);
+            messageCells.push(orderBuilder.endCell());
+        }
+
+        await this.#doRequest(INS_SIGN_TX, 0x04, 0x03, pathElementsToBuffer(path.map((v) => v + 0x80000000)));
+        const pkgCs = chunks(pkg, 255);
+        for (let i = 0; i < pkgCs.length; i++) {
+            await this.#doRequest(INS_SIGN_TX, 0x04, 0x02, pkgCs[i]);
+        }
+        let res: Buffer | null = null;
+        for (let i = 0; i < messagePkgs.length; i++) {
+            const pkgCs = chunks(messagePkgs[i], 255);
+            for (let j = 0; j < pkgCs.length; j++) {
+                let flags = 4;
+                if (j === 0) {
+                    flags |= 1;
+                }
+                if (j < pkgCs.length - 1) {
+                    flags |= 2;
+                }
+                if (i === messagePkgs.length - 1 && j === pkgCs.length - 1) {
+                    res = await this.#doRequest(INS_SIGN_TX, flags, 0, pkgCs[j]);
+                } else {
+                    await this.#doRequest(INS_SIGN_TX, flags, 2, pkgCs[j]);
+                }
+            }
+        }
+        if (res === null) {
+            throw Error('No response received');
+        }
+
+        // Transfer message
+        let transferB = beginCell()
+            .storeUint(subwalletId, 32)
+            .storeUint(transaction.timeout, 32)
+            .storeUint(transaction.seqno, 32);
+
+        if (includeWalletOp) {
+            transferB = transferB.storeUint(0, 8)
+        }
+
+        for (let i = 0; i < messages.length; i++) {
+            transferB = transferB.storeUint(messages[i].sendMode, 8)
+                .storeRef(messageCells[i])
+        }
+
+        let transfer = transferB.endCell();
+
+        // Parse result
+        let signature = res.slice(1, 1 + 64);
+        let hash = res.slice(2 + 64, 2 + 64 + 32);
+        if (!hash.equals(transfer.hash())) {
+            throw Error('Hash mismatch. Expected: ' + transfer.hash().toString('hex') + ', got: ' + hash.toString('hex'));
+        }
+        if (!signVerify(hash, signature, publicKey)) {
+            throw Error('Received signature is invalid');
+        }
+
+        // Build a message
+        return beginCell()
+            .storeBuffer(signature)
+            .storeSlice(transfer.beginParse())
+            .endCell();
+    }
+
     signTransaction = async (
         path: number[],
         transaction: {
@@ -1369,6 +1586,7 @@ export class TonTransport {
             walletSpecifiers?: {
                 subwalletId?: number,
                 includeWalletOp: boolean,
+                expectedPublicKey?: Buffer,
             },
             extraCurrency?: {
                 index: number,
@@ -1389,6 +1607,10 @@ export class TonTransport {
         //
 
         let publicKey = (await this.getAddress(path)).publicKey;
+
+        if (transaction.walletSpecifiers?.expectedPublicKey !== undefined && !transaction.walletSpecifiers.expectedPublicKey.equals(publicKey)) {
+            throw Error('Expected public key mismatch');
+        }
 
         //
         // Create package
@@ -1411,11 +1633,15 @@ export class TonTransport {
             if (transaction.extraCurrency !== undefined) {
                 flags |= 2;
             }
+            if (transaction.walletSpecifiers?.expectedPublicKey !== undefined) {
+                flags |= 4;
+            }
 
             pkg = Buffer.concat([
                 pkg,
                 writeUint32(subwalletId),
                 writeUint8(flags),
+                transaction.walletSpecifiers?.expectedPublicKey ?? Buffer.alloc(0),
             ]);
         }
 
